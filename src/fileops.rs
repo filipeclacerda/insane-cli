@@ -54,6 +54,21 @@ pub fn confirm(prompt: &str) -> bool {
     matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+/// Reads a y/N answer from a caller-supplied reader and returns `true` only
+/// for an explicit `y`/`yes`. This is a testing seam for [`confirm`]; it
+/// skips the terminal check so tests can drive it with an in-memory reader
+/// without blocking on a real stdin.
+pub fn confirm_from_reader<R: std::io::BufRead>(prompt: &str, stdin: &mut R) -> bool {
+    eprint!("{prompt} [y/N] ");
+    let _ = std::io::stderr().flush();
+
+    let mut line = String::new();
+    if stdin.read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
 /// Path of the backup file created before overwriting `path`.
 pub fn backup_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
@@ -171,8 +186,21 @@ mod tests {
 
     #[test]
     fn confirm_is_false_on_non_terminal_stdin() {
-        // The test harness's stdin is not a terminal, so this must not
-        // block and must default to the safe answer.
-        assert!(!confirm("proceed?"));
+        // An empty reader yields no `y`/`yes` answer, so the safe default
+        // (false) must be returned without blocking on a real stdin.
+        let mut empty = std::io::Cursor::new(Vec::<u8>::new());
+        assert!(!confirm_from_reader("proceed?", &mut empty));
+    }
+
+    #[test]
+    fn confirm_from_reader_returns_true_on_yes() {
+        let mut input = std::io::Cursor::new(b"yes\n".to_vec());
+        assert!(confirm_from_reader("proceed?", &mut input));
+    }
+
+    #[test]
+    fn confirm_from_reader_returns_false_on_n() {
+        let mut input = std::io::Cursor::new(b"n\n".to_vec());
+        assert!(!confirm_from_reader("proceed?", &mut input));
     }
 }

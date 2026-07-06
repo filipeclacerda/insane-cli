@@ -285,15 +285,16 @@ mod tests {
 
     #[tokio::test]
     async fn edit_file_unique_match_succeeds_without_confirmation_prompted_denied() {
-        // stdin is not a TTY in the test harness, so confirmation is always
-        // refused -- this proves a *unique* match still reaches the
-        // confirmation step (rather than failing earlier) and that a
-        // refusal leaves the file untouched.
+        // A `FakeUi` that always refuses -- this proves a *unique* match
+        // still reaches the confirmation step (rather than failing earlier)
+        // and that a refusal leaves the file untouched. Using `FakeUi`
+        // (instead of relying on stdin not being a TTY) keeps the test from
+        // blocking when run from an interactive terminal.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f.txt");
         std::fs::write(&path, "hello world").unwrap();
 
-        let mut perms = Permissions::new();
+        let mut perms = Permissions::with_ui(Box::new(crate::ui::test_support::FakeUi::deny()));
         let ignore: Vec<String> = vec![];
         let mut c = ctx(dir.path().to_path_buf(), &ignore, &mut perms);
         let args =
@@ -335,7 +336,7 @@ mod tests {
     #[tokio::test]
     async fn write_file_denied_on_non_tty_leaves_no_new_file() {
         let dir = tempfile::tempdir().unwrap();
-        let mut perms = Permissions::new();
+        let mut perms = Permissions::with_ui(Box::new(crate::ui::test_support::FakeUi::deny()));
         let ignore: Vec<String> = vec![];
         let mut c = ctx(dir.path().to_path_buf(), &ignore, &mut perms);
         let args = json!({"path": "new.txt", "content": "hi"}).to_string();
@@ -404,7 +405,7 @@ mod tests {
     #[tokio::test]
     async fn run_command_denied_on_non_tty() {
         let dir = tempfile::tempdir().unwrap();
-        let mut perms = Permissions::new();
+        let mut perms = Permissions::with_ui(Box::new(crate::ui::test_support::FakeUi::deny()));
         let args = json!({"command": "echo hi"}).to_string();
         let err = exec::run_command(&args, dir.path(), &mut perms)
             .await

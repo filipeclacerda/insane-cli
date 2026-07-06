@@ -26,6 +26,7 @@ use insane_cli::output::OutputOptions;
 use insane_cli::session::Session;
 use insane_cli::tools::permission::Permissions;
 use insane_cli::ui::PlainUi;
+use insane_cli::ui::test_support::FakeUi;
 use insane_cli::AppContext;
 use serde_json::json;
 
@@ -355,7 +356,8 @@ async fn write_file_is_refused_on_non_tty_and_leaves_no_file() {
 
     let ctx = default_ctx(&server.base_url);
     let mut session = new_session();
-    let mut permissions = Permissions::new();
+    let ui = FakeUi::deny();
+    let mut permissions = Permissions::with_ui(Box::new(FakeUi::deny()));
 
     agent::run_turn(
         &ctx,
@@ -363,7 +365,7 @@ async fn write_file_is_refused_on_non_tty_and_leaves_no_file() {
         &mut permissions,
         dir.path(),
         20,
-        &PlainUi::new(ctx.out),
+        &ui,
     )
     .await
     .expect("turn completes even after a denied write");
@@ -397,7 +399,8 @@ async fn edit_file_is_refused_on_non_tty_and_leaves_file_intact() {
 
     let ctx = default_ctx(&server.base_url);
     let mut session = new_session();
-    let mut permissions = Permissions::new();
+    let ui = FakeUi::deny();
+    let mut permissions = Permissions::with_ui(Box::new(FakeUi::deny()));
 
     agent::run_turn(
         &ctx,
@@ -405,7 +408,7 @@ async fn edit_file_is_refused_on_non_tty_and_leaves_file_intact() {
         &mut permissions,
         dir.path(),
         20,
-        &PlainUi::new(ctx.out),
+        &ui,
     )
     .await
     .expect("turn completes even after a denied edit");
@@ -621,7 +624,8 @@ async fn run_command_is_refused_on_non_tty_and_never_executes() {
 
     let ctx = default_ctx(&server.base_url);
     let mut session = new_session();
-    let mut permissions = Permissions::new();
+    let ui = FakeUi::deny();
+    let mut permissions = Permissions::with_ui(Box::new(FakeUi::deny()));
 
     agent::run_turn(
         &ctx,
@@ -629,7 +633,7 @@ async fn run_command_is_refused_on_non_tty_and_never_executes() {
         &mut permissions,
         dir.path(),
         20,
-        &PlainUi::new(ctx.out),
+        &ui,
     )
     .await
     .expect("turn completes even after a denied command");

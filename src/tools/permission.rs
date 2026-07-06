@@ -177,11 +177,12 @@ impl Default for Permissions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::test_support::FakeUi;
 
     #[tokio::test]
     async fn non_tty_stdin_always_refuses() {
-        // The test harness's stdin is not a terminal.
-        let mut p = Permissions::new();
+        // A `FakeUi` that always answers `No` -- tests never touch real stdin.
+        let mut p = Permissions::with_ui(Box::new(FakeUi::deny()));
         assert!(!p.confirm("write_file", "write?").await);
         assert!(!p.confirm_command("echo hi").await);
     }
@@ -195,7 +196,7 @@ mod tests {
 
     #[tokio::test]
     async fn accept_edits_skips_file_prompt_but_not_shell_prompt() {
-        let mut p = Permissions::new();
+        let mut p = Permissions::with_ui(Box::new(FakeUi::deny()));
         p.set_policy(ApprovalPolicy::AcceptEdits);
         assert!(p.confirm("write_file", "write?").await);
         assert!(p.confirm("edit_file", "edit?").await);
@@ -204,7 +205,7 @@ mod tests {
 
     #[tokio::test]
     async fn plan_mode_rejects_mutations() {
-        let mut p = Permissions::new();
+        let mut p = Permissions::with_ui(Box::new(FakeUi::deny()));
         p.set_policy(ApprovalPolicy::Plan);
         assert!(!p.confirm("write_file", "write?").await);
         assert!(!p.confirm_command("echo hi").await);

@@ -240,6 +240,73 @@ impl AgentUi for PlainUi {
     }
 }
 
+// ---------------------------------------------------------------------
+// FakeUi: a non-blocking `AgentUi` for tests. Every confirmation returns
+// a fixed `Decision` (default `No`), so tests never touch real stdin and
+// never block. Enabled for unit tests (`cfg(test)`) and, behind the
+// `test-utils` feature, for integration tests in tests/.
+// ---------------------------------------------------------------------
+
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_support {
+    use super::{AgentUi, ConfirmRequest, Decision, Duration, Usage};
+
+    /// A test double for [`AgentUi`] that answers every confirmation with a
+    /// fixed [`Decision`] (default [`Decision::No`]) and otherwise no-ops.
+    /// Use it via `Permissions::with_ui(Box::new(FakeUi::deny()))` so tests
+    /// never block on a real stdin.
+    pub struct FakeUi {
+        pub answer: Decision,
+    }
+
+    impl FakeUi {
+        pub fn deny() -> Self {
+            FakeUi {
+                answer: Decision::No,
+            }
+        }
+        pub fn accept() -> Self {
+            FakeUi {
+                answer: Decision::Yes,
+            }
+        }
+        pub fn always() -> Self {
+            FakeUi {
+                answer: Decision::Always,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentUi for FakeUi {
+        async fn confirm(&self, _req: ConfirmRequest) -> Decision {
+            self.answer
+        }
+        fn tool_trace(&self, _name: &str, _arguments: &str) {}
+        fn tool_summary(
+            &self,
+            _name: &str,
+            _arguments: &str,
+            _result: &str,
+            _elapsed: Duration,
+        ) {
+        }
+        fn warn(&self, _msg: &str) {}
+        fn stream_text(&self, _chunk: &str) {}
+        fn end_of_stream(&self) {}
+        fn spinner_tick(&self, _line: &str) {}
+        fn clear_status(&self) {}
+        fn turn_summary(
+            &self,
+            _rounds: u32,
+            _tools_executed: u32,
+            _usage: Option<&Usage>,
+            _elapsed: Duration,
+        ) {
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

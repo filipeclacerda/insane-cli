@@ -1325,6 +1325,7 @@ dependencies = [
  "directories",
  "futures-util",
  "ignore",
+ "insane-cli",
  "keyring",
  "predicates",
  "rand 0.8.6",

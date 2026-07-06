@@ -70,6 +70,15 @@ async fn concurrent_requests_never_exceed_capacity_in_any_window() {
          (proves every concurrent caller passed through the same shared limiter)"
     );
 
+    // This test measures *server arrival* timestamps, but the limiter's
+    // guarantee is over *admission* timestamps (the instant `acquire()`
+    // succeeds on the client). The two differ by request latency, so the
+    // gap between consecutive admission batches (≈ `window`) shows up at
+    // the server as `window + skew`. With `window = 1s` the inter-batch
+    // arrival gap is ~1.008s, comfortably larger than the 1s window we
+    // check, so a sliding window of arrival times can never straddle two
+    // admission batches. (The sibling `metrics_total_matches_concurrent_call_count`
+    // test uses the same 1s window for the same reason -- see its comment.)
     assert_no_window_exceeds(&timestamps, capacity, window);
 }
 
@@ -78,7 +87,23 @@ async fn metrics_total_matches_concurrent_call_count() {
     // A second, independent run with different numbers, to make sure the
     // invariant isn't an artifact of one particular capacity/n combination.
     let capacity = 8;
-    let window = Duration::from_millis(750);
+    // NOTE: previously 750 ms, which made the test flaky. The limiter
+    // bounds *admission* timestamps, but this test measures *server
+    // arrival* timestamps, which lag admission by request latency. Under
+    // load, consecutive admission batches (each ≈ `window` apart) arrive at
+    // the server as compact clusters separated by `window + skew` (skew ≈
+    // 7-13 ms of round-trip latency). With `window = 750 ms` that inter-
+    // batch arrival gap is ~757 ms -- only ~7 ms more than the window --
+    // so a sliding 750 ms window of arrival times intermittently straddled
+    // two admission batches and counted up to 2×capacity, producing the
+    // flake. Widening the window to 1 s (matching the sibling test above)
+    // makes the inter-batch arrival gap (~1.008 s) comfortably exceed the
+    // checked window, so a sliding window can never span two batches. This
+    // does not weaken the limiter's real guarantee (≤ capacity admissions
+    // per `window`, verified by the unit test `never_exceeds_capacity_in_any_window`
+    // in `src/limiter.rs`, which measures post-acquire timestamps directly);
+    // it only decouples this end-to-end test from sub-10 ms scheduler jitter.
+    let window = Duration::from_secs(1);
     let n = 33;
 
     let (timestamps, total_acquired) = fire_concurrent_requests(capacity, window, n).await;
