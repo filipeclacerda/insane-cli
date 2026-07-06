@@ -70,6 +70,11 @@ Subcomando do clap vira opcional; ausência = `chat` (com tools). `insane --no-t
 
 ### B4. Teclas e comandos
 - Enter envia; input vazio + Ctrl+D ou `/exit` sai; Ctrl+C durante turno cancela o turno (mantém sessão), Ctrl+C com input vazio e sem turno ativo sai; Ctrl+L = /clear.
+
+### B5. Menções `@file` no input
+- Digitar `@` abre a mesma paleta de sugestões dos slash commands, listando arquivos/dirs do cwd (respeitando `.gitignore`, `config.ignore` e a denylist fixa de chaves/certificados). Caracteres adicionais filtram por prefixo do último segmento do path (ex.: `@READ` casa `README.md`) ou pelo path completo (`@src/app`).
+- ↑/↓ seleciona, Tab/Enter completa **apenas o token `@…`** sob o cursor (não a linha inteira), permitindo menções no meio da mensagem (ex.: `explique @src/lib.rs e @README.md`).
+- Ao enviar, cada `@path` resolvível é expandido inline como bloco fenced (mesmo formato de `ask -f`/`context::format_block`) e uma linha `inlined N file mention(s)` aparece no transcript; tokens não-resolvíveis (dir, inexistente, fora do sandbox) são deixados literais para o modelo decidir. `@` no meio de uma palavra (ex.: `me@host.com`) não é tratado como menção.
 - Slash commands existentes funcionam (/exit /clear /model /tools /cwd /continue) + `/help`.
 - Histórico de inputs com ↑/↓ (em memória, sessão apenas).
 

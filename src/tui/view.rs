@@ -179,7 +179,7 @@ fn draw_suggestions(frame: &mut Frame, area: Rect, state: &AppState) {
         Paragraph::new(lines)
             .style(theme::panel())
             .block(theme::block(
-                " commands  \u{2191}/\u{2193} select  Tab complete ",
+                " commands / @files  \u{2191}/\u{2193} select  Tab complete ",
             )),
         area,
     );
@@ -405,7 +405,7 @@ mod tests {
 
     #[test]
     fn approval_is_rendered_in_bottom_layout() {
-        let mut state = AppState::new("model".into(), ".".into());
+        let mut state = AppState::new("model".into(), ".".into(), ".".into());
         let (tx, _rx) = tokio::sync::oneshot::channel();
         state.confirm = Some(PendingConfirm {
             req: ConfirmRequest {

@@ -4,7 +4,10 @@
 //! agentic turn's future) and the render loop (polling the same task via
 //! `tokio::select!`) can share it without channels.
 
+use std::path::PathBuf;
+
 use crate::client::Usage;
+use crate::context;
 use crate::session::SLASH_COMMANDS;
 use crate::ui::ConfirmRequest;
 
@@ -119,6 +122,12 @@ pub struct AppState {
     pub providers: Vec<String>,
     pub mode: InteractionMode,
     pub cwd_display: String,
+    /// The process cwd, used for `@file` mention suggestions and for
+    /// expanding `@path` tokens into inline file content on submit.
+    pub cwd: PathBuf,
+    /// Extra ignore globs from config, applied to `@file` suggestions so the
+    /// palette never offers gitignored/denylisted paths.
+    pub ignore: Vec<String>,
     pub messages: Vec<MsgBlock>,
     pub input: String,
     /// Cursor position within `input`, in chars.
@@ -141,7 +150,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(model: String, cwd_display: String) -> Self {
+    pub fn new(model: String, cwd_display: String, cwd: PathBuf) -> Self {
         AppState {
             model,
             models: Vec::new(),
@@ -149,6 +158,8 @@ impl AppState {
             providers: Vec::new(),
             mode: InteractionMode::Auto,
             cwd_display,
+            cwd,
+            ignore: Vec::new(),
             messages: Vec::new(),
             input: String::new(),
             cursor: 0,
@@ -251,6 +262,14 @@ impl AppState {
     }
 
     pub fn suggestions(&self) -> Vec<InputSuggestion> {
+        // `@file` mention: detected anywhere in the input at the cursor
+        // position (e.g. "explain @READ" with the cursor right after READ).
+        // Mirrors the slash palette's UX: typing `@` opens the list, further
+        // chars filter it.
+        if let Some(suggestions) = self.file_mention_suggestions() {
+            return suggestions;
+        }
+
         if self.input.contains('\n') || !self.input.starts_with('/') {
             return Vec::new();
         }
@@ -265,6 +284,7 @@ impl AppState {
                     value: format!("/model {model}"),
                     label: model.clone(),
                     description: "modelo NIM".to_string(),
+                    replace_range: None,
                 })
                 .collect();
         }
@@ -279,6 +299,7 @@ impl AppState {
                     value: format!("/provider {provider}"),
                     label: provider.clone(),
                     description: "provider profile".to_string(),
+                    replace_range: None,
                 })
                 .collect();
         }
@@ -296,6 +317,7 @@ impl AppState {
                 value: format!("/mode {mode}"),
                 label: mode.to_string(),
                 description: description.to_string(),
+                replace_range: None,
             })
             .collect();
         }
@@ -311,8 +333,121 @@ impl AppState {
                 value: cmd.usage.to_string(),
                 label: cmd.usage.to_string(),
                 description: cmd.description.to_string(),
+                replace_range: None,
             })
             .collect()
+    }
+
+    /// Detects a `@<query>` token immediately left of the cursor and returns
+    /// matching file/directory paths under `cwd` (respecting `.gitignore`,
+    /// the config `ignore` list, and the fixed high-risk filename denylist).
+    /// Returns `None` when the cursor isn't sitting right after such a token
+    /// (so the caller falls back to slash-command suggestions).
+    fn file_mention_suggestions(&self) -> Option<Vec<InputSuggestion>> {
+        // Find the `@` that opens the mention: scan left from the cursor
+        // over non-whitespace chars until we hit `@` or a whitespace char.
+        let chars: Vec<char> = self.input.chars().collect();
+        if self.cursor > chars.len() {
+            return None;
+        }
+        let mut i = self.cursor;
+        // The token must be non-empty only if the user typed something after
+        // `@`; a bare `@` right at the cursor still opens the palette.
+        while i > 0 {
+            let prev = chars[i - 1];
+            if prev.is_whitespace() {
+                return None;
+            }
+            if prev == '@' {
+                break;
+            }
+            i -= 1;
+        }
+        // `i` now points just after the `@`. Ensure the char at i-1 is `@`
+        // and that it's itself preceded by start-of-input or whitespace (so
+        // an email-like `a@b` mid-word doesn't trigger).
+        if i == 0 || chars[i - 1] != '@' {
+            return None;
+        }
+        let at_index = i - 1;
+        if at_index > 0 && !chars[at_index - 1].is_whitespace() {
+            return None;
+        }
+        let query: String = chars[i..self.cursor].iter().collect();
+        let matches = self.list_files_for_mention(&query);
+        let replace_range = (at_index, self.cursor);
+        let suggestions = matches
+            .into_iter()
+            .map(|path| {
+                let is_dir = path.ends_with('/');
+                let description = if is_dir {
+                    "diretório".to_string()
+                } else {
+                    "arquivo".to_string()
+                };
+                InputSuggestion {
+                    // `value` is the literal text to insert in place of the
+                    // `@query` token (the `@` is kept, the path follows).
+                    value: format!("@{path}"),
+                    label: path,
+                    description,
+                    replace_range: Some(replace_range),
+                }
+            })
+            .collect();
+        Some(suggestions)
+    }
+
+    /// Lists non-ignored, non-denylisted entries under `cwd` whose relative
+    /// path starts with `query` (case-insensitive on the last path segment),
+    /// capped to a small number for the palette. Directories get a trailing
+    /// `/`.
+    fn list_files_for_mention(&self, query: &str) -> Vec<String> {
+        const MAX_MENTIONS: usize = 50;
+        let query_lower = query.to_ascii_lowercase();
+        let mut entries: Vec<String> = Vec::new();
+        let walker = ignore::WalkBuilder::new(&self.cwd).build();
+        for result in walker {
+            let entry = match result {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if path == self.cwd {
+                continue;
+            }
+            if context::check_denylist(path).is_err() {
+                continue;
+            }
+            if context::check_ignored(path, &self.cwd, &self.ignore).is_err() {
+                continue;
+            }
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let mut rel = path
+                .strip_prefix(&self.cwd)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if is_dir {
+                rel.push('/');
+            }
+            // Filter: the query matches a path-segment prefix (so `READ`
+            // matches `README.md` and `docs/REPORT.md` matches `docs/RE`).
+            let last_segment = rel.rsplit('/').next().unwrap_or(&rel).to_ascii_lowercase();
+            if !query_lower.is_empty() && !last_segment.starts_with(&query_lower) {
+                // Also allow matching against the full path prefix for
+                // nested queries like `src/app`.
+                if !rel.to_ascii_lowercase().starts_with(&query_lower) {
+                    continue;
+                }
+            }
+            entries.push(rel);
+            if entries.len() >= MAX_MENTIONS {
+                break;
+            }
+        }
+        entries.sort();
+        entries
     }
 
     pub fn selected_suggestion(&self) -> Option<InputSuggestion> {
@@ -416,6 +551,10 @@ pub struct InputSuggestion {
     pub value: String,
     pub label: String,
     pub description: String,
+    /// When set, completing this suggestion replaces only the char range
+    /// `[start, end)` within `input` (used by `@file` mentions, which can
+    /// appear mid-line) instead of the whole input line (slash commands).
+    pub replace_range: Option<(usize, usize)>,
 }
 
 fn byte_index_for_char(text: &str, char_index: usize) -> usize {
@@ -431,7 +570,7 @@ mod tests {
 
     #[test]
     fn edits_input_at_unicode_cursor() {
-        let mut app = AppState::new("m".into(), ".".into());
+        let mut app = AppState::new("m".into(), ".".into(), ".".into());
         app.set_input("olá".into());
         app.cursor = 2;
         app.insert_char('X');
@@ -442,7 +581,7 @@ mod tests {
 
     #[test]
     fn discards_last_non_empty_assistant_message() {
-        let mut app = AppState::new("m".into(), ".".into());
+        let mut app = AppState::new("m".into(), ".".into(), ".".into());
         app.push_assistant_chunk("Vou explorar mais arquivos.");
         app.start_new_assistant_message_boundary();
         app.discard_last_assistant_message();
@@ -456,7 +595,7 @@ mod tests {
 
     #[test]
     fn slash_palette_switches_to_model_results() {
-        let mut app = AppState::new("current".into(), ".".into());
+        let mut app = AppState::new("current".into(), ".".into(), ".".into());
         app.set_models(vec!["meta/llama".into(), "mistral/nemo".into()]);
         app.set_input("/model llama".into());
         let suggestions = app.suggestions();
@@ -466,7 +605,7 @@ mod tests {
 
     #[test]
     fn slash_palette_suggests_interaction_modes() {
-        let mut app = AppState::new("m".into(), ".".into());
+        let mut app = AppState::new("m".into(), ".".into(), ".".into());
         app.set_input("/mode acc".into());
         let suggestions = app.suggestions();
         assert_eq!(suggestions.len(), 1);
@@ -475,9 +614,64 @@ mod tests {
 
     #[test]
     fn vertical_cursor_navigation_preserves_column() {
-        let mut app = AppState::new("m".into(), ".".into());
+        let mut app = AppState::new("m".into(), ".".into(), ".".into());
         app.set_input("abcd\nxy".into());
         assert!(app.move_cursor_vertical(-1));
         assert_eq!(app.cursor, 2);
+    }
+
+    #[test]
+    fn at_mention_opens_palette_at_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "x").unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "x").unwrap();
+        let mut app = AppState::new(
+            "m".into(),
+            ".".into(),
+            dir.path().to_path_buf(),
+        );
+        app.set_input("explain @READ".into());
+        // cursor lands at end of input after set_input (13 chars).
+        let suggestions = app.suggestions();
+        assert!(suggestions.iter().any(|s| s.label == "README.md"));
+        // Each suggestion carries a replace_range covering the `@READ` token.
+        let first = suggestions.iter().find(|s| s.label == "README.md").unwrap();
+        assert_eq!(first.value, "@README.md");
+        assert_eq!(first.replace_range, Some((8, 13)));
+    }
+
+    #[test]
+    fn at_mention_requires_at_preceded_by_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "x").unwrap();
+        let mut app = AppState::new(
+            "m".into(),
+            ".".into(),
+            dir.path().to_path_buf(),
+        );
+        // `a@READ` mid-word must NOT trigger the file palette.
+        app.set_input("contact a@READ".into());
+        let suggestions = app.suggestions();
+        assert!(suggestions.is_empty());
+    }
+
+    #[test]
+    fn at_mention_respects_gitignore_and_denylist() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(dir.path().join("ignored.txt"), "x").unwrap();
+        std::fs::write(dir.path().join("kept.rs"), "x").unwrap();
+        std::fs::write(dir.path().join("id_rsa"), "x").unwrap();
+        let mut app = AppState::new(
+            "m".into(),
+            ".".into(),
+            dir.path().to_path_buf(),
+        );
+        app.set_input("@".into());
+        let suggestions = app.suggestions();
+        let labels: Vec<&str> = suggestions.iter().map(|s| s.label.as_str()).collect();
+        assert!(labels.contains(&"kept.rs"));
+        assert!(!labels.contains(&"ignored.txt"));
+        assert!(!labels.contains(&"id_rsa"));
     }
 }

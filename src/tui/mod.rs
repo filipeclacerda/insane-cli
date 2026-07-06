@@ -122,7 +122,15 @@ async fn run_app(
         sync_agent_prompt(ctx, &mut session, &cwd, InteractionMode::Auto);
     }
 
-    let state = Arc::new(Mutex::new(AppState::new(model, cwd_display)));
+    let state = Arc::new(Mutex::new(AppState::new(
+        model,
+        cwd_display,
+        cwd.clone(),
+    )));
+    {
+        let mut st = state.lock().unwrap();
+        st.ignore = ctx.cfg.ignore.clone();
+    }
     let ui = TuiUi::new(state.clone());
     let mut permissions = Permissions::with_ui(Box::new(TuiUi::new(state.clone())));
     let mut last_finish_reason: Option<String> = None;
@@ -378,6 +386,128 @@ fn completion_text(value: &str) -> String {
         Some(idx) => value[..idx].trim_end().to_string() + " ",
         None => value.to_string(),
     }
+}
+
+/// Applies a suggestion to `input`/`cursor`, honoring `replace_range`:
+/// `@file` mentions replace only the `@query` token at the cursor, while
+/// slash commands replace the whole input line (the original behavior).
+/// Returns the new `(input, cursor)`.
+fn apply_completion(
+    input: &str,
+    _cursor: usize,
+    suggestion: &crate::tui::app::InputSuggestion,
+) -> (String, usize) {
+    if let Some((start, end)) = suggestion.replace_range {
+        let chars: Vec<char> = input.chars().collect();
+        let start = start.min(chars.len());
+        let end = end.min(chars.len()).max(start);
+        let before: String = chars[..start].iter().collect();
+        let after: String = chars[end..].iter().collect();
+        let inserted: Vec<char> = suggestion.value.chars().collect();
+        let new_cursor = start + inserted.len();
+        let mut new_input = before;
+        new_input.push_str(&suggestion.value);
+        new_input.push_str(&after);
+        (new_input, new_cursor)
+    } else {
+        // Slash-command completion: replace the whole input line.
+        (completion_text(&suggestion.value), 0)
+    }
+}
+
+/// Expands `@path` mention tokens in `line` into inline fenced file
+/// content, mirroring `ask -f`/`context::format_block`. Tokens that don't
+/// resolve to a readable, non-ignored, non-denylisted file inside the
+/// sandbox are left untouched (so the model still sees the literal `@path`
+/// and can decide what to do). Directories are skipped (left as-is) since
+/// the agent has `list_files` for those.
+fn expand_file_mentions(
+    line: &str,
+    cwd: &std::path::Path,
+    ignore: &[String],
+    state: &Arc<Mutex<AppState>>,
+) -> String {
+    if !line.contains('@') {
+        return line.to_string();
+    }
+    let mut out = String::new();
+    let mut rest = line;
+    let mut expanded_count: usize = 0;
+    while let Some(at_idx) = rest.find('@') {
+        // `@` must be at start-of-input or preceded by whitespace to count
+        // as a mention (avoids mangling emails like `a@b`).
+        let is_mention_start = at_idx == 0
+            || rest[..at_idx]
+                .chars()
+                .next_back()
+                .map(|c| c.is_whitespace())
+                .unwrap_or(true);
+        out.push_str(&rest[..at_idx]);
+        if !is_mention_start {
+            out.push('@');
+            rest = &rest[at_idx + 1..];
+            continue;
+        }
+        // Collect the token after `@`: path chars up to the next whitespace.
+        let after = &rest[at_idx + 1..];
+        let token_end = after
+            .char_indices()
+            .skip_while(|(_, c)| !c.is_whitespace())
+            .map(|(i, _)| i)
+            .next()
+            .unwrap_or(after.len());
+        let token = &after[..token_end];
+        if token.is_empty() {
+            // Bare `@` followed by whitespace: leave it.
+            out.push('@');
+            rest = after;
+            continue;
+        }
+        match resolve_mention(cwd, token, ignore) {
+            Some(content) => {
+                out.push_str(&content);
+                out.push('\n');
+                expanded_count += 1;
+            }
+            None => {
+                // Unresolvable: keep the literal `@token`.
+                out.push('@');
+                out.push_str(token);
+            }
+        }
+        rest = &after[token_end..];
+    }
+    out.push_str(rest);
+
+    // Surface a one-line note in the conversation so the user sees what was
+    // inlined (the expanded content itself goes to the model, not the
+    // visible transcript).
+    if expanded_count > 0 {
+        let mut st = state.lock().unwrap();
+        st.push_warn(format!(
+            "inlined {expanded_count} file mention(s) (@path) into the message"
+        ));
+    }
+    out
+}
+
+/// Resolves a single `@token` to inline fenced content, applying the same
+/// sandbox/denylist/ignore checks as the `read_file` tool. Returns `None`
+/// for directories or anything that fails a check.
+fn resolve_mention(
+    cwd: &std::path::Path,
+    token: &str,
+    ignore: &[String],
+) -> Option<String> {
+    let resolved = crate::tools::sandbox::resolve_in_sandbox(cwd, token).ok()?;
+    crate::context::check_denylist(&resolved).ok()?;
+    crate::context::check_ignored(&resolved, cwd, ignore).ok()?;
+    if !resolved.is_file() {
+        return None;
+    }
+    let bytes = std::fs::read(&resolved).ok()?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    Some(crate::context::format_block(token, &text))
 }
 
 /// Routes a key to the open confirmation modal, if any (SPEC-UX B3).
@@ -645,8 +775,11 @@ fn handle_key(
                 let mut st = state.lock().unwrap();
                 if let Some(suggestion) = st.selected_suggestion() {
                     if st.input != suggestion.value {
-                        let completed = completion_text(&suggestion.value);
-                        st.set_input(completed);
+                        let (new_input, new_cursor) =
+                            apply_completion(&st.input, st.cursor, &suggestion);
+                        st.set_input(new_input);
+                        st.cursor = new_cursor;
+                        st.dirty = true;
                         return false;
                     }
                 }
@@ -714,7 +847,11 @@ fn handle_key(
         KeyCode::Tab => {
             let mut st = state.lock().unwrap();
             if let Some(suggestion) = st.selected_suggestion() {
-                st.set_input(completion_text(&suggestion.value));
+                let (new_input, new_cursor) =
+                    apply_completion(&st.input, st.cursor, &suggestion);
+                st.set_input(new_input);
+                st.cursor = new_cursor;
+                st.dirty = true;
             } else {
                 st.insert_char('\t');
             }
@@ -1010,7 +1147,8 @@ Shift+Tab=cycle mode  PgUp/PgDn=scroll  Ctrl+End=bottom  Ctrl+C=cancel/exit  Ctr
         st.push_user(line.clone());
         st.history_idx = None;
     }
-    session.push_user(line);
+    let expanded = expand_file_mentions(&line, cwd, &ctx.cfg.ignore, state);
+    session.push_user(expanded);
 
     if tools_enabled {
         state.lock().unwrap().processing = true;
@@ -1036,7 +1174,7 @@ mod tests {
 
     #[tokio::test]
     async fn approval_picker_uses_arrows_and_enter() {
-        let state = Arc::new(Mutex::new(AppState::new("m".into(), ".".into())));
+        let state = Arc::new(Mutex::new(AppState::new("m".into(), ".".into(), ".".into())));
         let (tx, rx) = tokio::sync::oneshot::channel();
         state.lock().unwrap().confirm = Some(PendingConfirm {
             req: ConfirmRequest {
@@ -1057,7 +1195,7 @@ mod tests {
 
     #[tokio::test]
     async fn sensitive_approval_never_offers_always() {
-        let state = Arc::new(Mutex::new(AppState::new("m".into(), ".".into())));
+        let state = Arc::new(Mutex::new(AppState::new("m".into(), ".".into(), ".".into())));
         let (tx, rx) = tokio::sync::oneshot::channel();
         state.lock().unwrap().confirm = Some(PendingConfirm {
             req: ConfirmRequest {
@@ -1074,5 +1212,85 @@ mod tests {
         handle_confirm_key(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &state);
         handle_confirm_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &state);
         assert_eq!(rx.await.unwrap(), Decision::No);
+    }
+
+    #[test]
+    fn apply_completion_replaces_only_at_token_for_mentions() {
+        let suggestion = crate::tui::app::InputSuggestion {
+            value: "@README.md".to_string(),
+            label: "README.md".to_string(),
+            description: "arquivo".to_string(),
+            replace_range: Some((8, 13)),
+        };
+        // "explain @READ" with the @READ token at chars [8,13).
+        let (new_input, new_cursor) = apply_completion("explain @READ", 13, &suggestion);
+        assert_eq!(new_input, "explain @README.md");
+        assert_eq!(new_cursor, "explain @README.md".len());
+    }
+
+    #[test]
+    fn apply_completion_replaces_whole_line_for_slash_commands() {
+        let suggestion = crate::tui::app::InputSuggestion {
+            value: "/model meta/llama <name>".to_string(),
+            label: "/model meta/llama".to_string(),
+            description: "modelo NIM".to_string(),
+            replace_range: None,
+        };
+        let (new_input, new_cursor) = apply_completion("/mod", 4, &suggestion);
+        assert_eq!(new_input, "/model meta/llama ");
+        assert_eq!(new_cursor, 0);
+    }
+
+    #[test]
+    fn expand_file_mentions_inlines_readable_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "# hi\n").unwrap();
+        let state = Arc::new(Mutex::new(AppState::new(
+            "m".into(),
+            ".".into(),
+            dir.path().to_path_buf(),
+        )));
+        let expanded = expand_file_mentions(
+            "explain @README.md please",
+            dir.path(),
+            &[],
+            &state,
+        );
+        assert!(expanded.contains("File: README.md"));
+        assert!(expanded.contains("# hi"));
+        assert!(expanded.contains("please"));
+        // The literal `@README.md` is gone (replaced by the fenced block).
+        assert!(!expanded.contains("@README.md"));
+        // A warn note was pushed.
+        assert!(state
+            .lock()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|m| matches!(m, crate::tui::app::MsgBlock::Warn(t) if t.contains("inlined"))));
+    }
+
+    #[test]
+    fn expand_file_mentions_leaves_unresolvable_tokens_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(AppState::new(
+            "m".into(),
+            ".".into(),
+            dir.path().to_path_buf(),
+        )));
+        let expanded = expand_file_mentions("see @does-not-exist.txt", dir.path(), &[], &state);
+        assert_eq!(expanded, "see @does-not-exist.txt");
+    }
+
+    #[test]
+    fn expand_file_mentions_ignores_email_like_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(AppState::new(
+            "m".into(),
+            ".".into(),
+            dir.path().to_path_buf(),
+        )));
+        let expanded = expand_file_mentions("contact me@host.com", dir.path(), &[], &state);
+        assert_eq!(expanded, "contact me@host.com");
     }
 }
