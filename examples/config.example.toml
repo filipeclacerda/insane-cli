@@ -1,0 +1,58 @@
+# Example insane-cli configuration.
+# Copy to {config_dir}/insane-cli/config.toml (see `insane config path`).
+# NEVER put an API key in this file -- use `insane config set-key` (OS keyring)
+# or the NVIDIA_API_KEY environment variable instead.
+
+active_provider = "nvidia"
+max_tokens = 4096
+temperature = 0.7
+stream = true
+ignore = ["*.generated.*", "vendor/**"]
+
+[cache]
+enabled = false
+ttl_secs = 3600
+
+[providers.nvidia]
+kind = "nvidia"
+model = "meta/llama-3.3-70b-instruct"
+api_key_env = "NVIDIA_API_KEY"
+timeout_secs = 60
+
+[providers.nvidia.rate_limit]
+# Capped at 40 for the public NVIDIA endpoint.
+rpm = 40
+# Independent pacing rule; use "0s" to disable.
+min_interval = "1s"
+
+[providers.lmstudio]
+kind = "lmstudio"
+base_url = "http://127.0.0.1:1234/v1"
+model = "openai/gpt-oss-20b"
+auth = "optional"
+api_key_env = "LMSTUDIO_API_KEY"
+timeout_secs = 120
+
+[providers.lmstudio.rate_limit]
+# Omit rpm for unlimited local requests.
+min_interval = "0s"
+
+[agent]
+# Cap on tool-calling rounds per user turn in `chat`/`ask --tools` before the
+# agent loop stops with a clear error (SPEC-AGENT §4).
+max_rounds = 20
+
+# Generation temperature used only for agent (tool-calling) turns. Defaults
+# to 0.2 for more deterministic tool calling, or to the global `temperature`
+# above if that was itself explicitly set and this is left unset.
+# temperature = 0.2
+
+# Detect a tool call emitted as plain text (some models, e.g. some
+# `z-ai/glm-*` variants, don't reliably use structured tool calling) and
+# recover it into a normal tool execution instead of silently dropping the
+# turn. Defaults to true.
+# lenient_tool_calls = true
+
+# Extra text appended to the end of the agent's system prompt -- e.g. house
+# rules ("always run cargo fmt before finishing", "never touch main.py").
+# system_prompt_extra = ""

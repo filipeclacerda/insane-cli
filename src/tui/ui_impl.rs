@@ -1,0 +1,101 @@
+//! `AgentUi` implementation backed by the shared `AppState` (SPEC-UX B0/B3).
+//! Every method just mutates state and marks it dirty -- rendering happens
+//! in the main loop, throttled to ~30fps. `confirm` is the one method that
+//! actually waits: it stashes a `PendingConfirm` (with a `oneshot` sender)
+//! into the state and awaits the receiver, which the main loop's key
+//! handling resolves once the user answers `y`/`n`/`a`/Esc.
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use crate::client::Usage;
+use crate::ui::{AgentUi, ConfirmRequest, Decision};
+
+use super::app::{AppState, PendingConfirm};
+
+pub struct TuiUi {
+    pub state: Arc<Mutex<AppState>>,
+}
+
+impl TuiUi {
+    pub fn new(state: Arc<Mutex<AppState>>) -> Self {
+        TuiUi { state }
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentUi for TuiUi {
+    async fn confirm(&self, req: ConfirmRequest) -> Decision {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut st = self.state.lock().unwrap();
+            st.confirm = Some(PendingConfirm {
+                req,
+                responder: tx,
+                scroll: 0,
+                selected: 0,
+            });
+            st.dirty = true;
+        }
+        rx.await.unwrap_or(Decision::No)
+    }
+
+    fn tool_trace(&self, name: &str, arguments: &str) {
+        let summary = crate::tools::tool_call_label(name, arguments);
+        let mut st = self.state.lock().unwrap();
+        st.push_tool_running(format!("{name}  {summary}"));
+    }
+
+    fn tool_summary(&self, name: &str, arguments: &str, result: &str, elapsed: Duration) {
+        let value: serde_json::Value = serde_json::from_str(result).unwrap_or_default();
+        let ok = value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        let line = crate::agent::tool_summary_line(name, arguments, result, elapsed);
+        let mut st = self.state.lock().unwrap();
+        st.finish_tool(ok, line);
+    }
+
+    fn warn(&self, msg: &str) {
+        let mut st = self.state.lock().unwrap();
+        st.push_warn(msg.to_string());
+    }
+
+    fn stream_text(&self, chunk: &str) {
+        let mut st = self.state.lock().unwrap();
+        st.push_assistant_chunk(chunk);
+    }
+
+    fn discard_last_assistant_message(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.discard_last_assistant_message();
+    }
+
+    fn end_of_stream(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.start_new_assistant_message_boundary();
+    }
+
+    fn spinner_tick(&self, line: &str) {
+        let mut st = self.state.lock().unwrap();
+        st.status.spinner_line = Some(line.to_string());
+        st.dirty = true;
+    }
+
+    fn clear_status(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.status.spinner_line = None;
+        st.dirty = true;
+    }
+
+    fn turn_summary(
+        &self,
+        rounds: u32,
+        tools_executed: u32,
+        usage: Option<&Usage>,
+        elapsed: Duration,
+    ) {
+        let line = crate::agent::turn_summary_line(rounds, tools_executed, usage, elapsed);
+        let mut st = self.state.lock().unwrap();
+        st.set_usage(usage);
+        st.push_turn_summary(line);
+    }
+}

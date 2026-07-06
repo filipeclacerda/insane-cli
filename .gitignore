@@ -1,0 +1,8 @@
+/target/
+**/*.rs.bk
+*.insane-bak
+*.pdb
+Cargo.lock.bak
+.env
+.env.*
+*.log
