@@ -28,7 +28,6 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -63,7 +62,7 @@ impl TerminalGuard {
     fn enter() -> io::Result<Term> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture,)?;
+        crossterm::execute!(stdout, EnterAlternateScreen)?;
         Terminal::new(CrosstermBackend::new(stdout))
     }
 }
@@ -71,12 +70,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
-        let _ = crossterm::execute!(
-            stdout,
-            DisableMouseCapture,
-            LeaveAlternateScreen,
-            crossterm::cursor::Show,
-        );
+        let _ = crossterm::execute!(stdout, LeaveAlternateScreen, crossterm::cursor::Show,);
         let _ = disable_raw_mode();
     }
 }
@@ -88,12 +82,7 @@ fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let mut stdout = io::stdout();
-        let _ = crossterm::execute!(
-            stdout,
-            DisableMouseCapture,
-            LeaveAlternateScreen,
-            crossterm::cursor::Show,
-        );
+        let _ = crossterm::execute!(stdout, LeaveAlternateScreen, crossterm::cursor::Show,);
         let _ = disable_raw_mode();
         let redacted = crate::secrets::redact(&crate::error::redact(&info.to_string()));
         eprintln!("{redacted}");

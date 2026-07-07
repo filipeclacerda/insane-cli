@@ -61,7 +61,7 @@ Subcomando do clap vira opcional; ausência = `chat` (com tools). `insane --no-t
 ├─ status: ⠋ round 2/20 · rate 38/40 · 1.9k tok · Ctrl+C cancel ───┤
 ```
 - Conversa: mensagens do usuário e do assistente com prefixo/cor distintos; tool calls como blocos compactos com ✓/✗; texto do assistente atualiza em streaming (re-render por chunk com throttle ~30fps).
-- Scroll: PgUp/PgDn e roda do mouse; auto-scroll para o fim enquanto streaming, a menos que o usuário tenha rolado para cima (retomar com End).
+- Scroll: PgUp/PgDn; auto-scroll para o fim enquanto streaming, a menos que o usuário tenha rolado para cima (retomar com End). A TUI não captura mouse para manter seleção/cópia nativa do terminal.
 - Barra de status: modelo, rodada, métricas do rate limiter, tokens, dica de teclas; spinner quando aguardando modelo.
 
 ### B3. Confirmações e diffs na TUI

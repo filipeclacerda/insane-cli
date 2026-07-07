@@ -245,9 +245,9 @@ estruturado da API. Para isso:
   slot, um resumo por tool (`✓ read_file agent.rs (14.2 KB, 3ms)` / `✗
   edit_file ... (user denied)`), e uma linha final com métricas do turno
   (`-- 3 rounds | 2 tools | 1.9k tokens | 14s`).
-- Na TUI, a roda do mouse rola a conversa e previews de aprovação. Como o
-  app captura eventos de mouse para isso, alguns terminais exigem `Shift` ao
-  arrastar para selecionar/copiar texto.
+- Na TUI, a seleção/cópia normal do terminal volta a funcionar porque o app
+  não captura mouse. Para rolar a conversa e os previews, use `PageUp` e
+  `PageDown`.
 
 ### Exemplo de sessão (ilustrativo)
 
