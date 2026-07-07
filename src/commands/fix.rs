@@ -46,10 +46,8 @@ pub async fn run(
     let source = file.to_string_lossy().into_owned();
     let original = std::fs::read_to_string(&file)
         .map_err(|e| ApiError::permanent(format!("failed to read {}: {e}", file.display())))?;
-    // Captured before `context::load`'s own (send-time) secret-scan
-    // confirmation, and used only to decide whether `--yes` may skip the
-    // separate write-time confirmation below (SPEC §6: never for writes
-    // with detected secrets).
+    // Used only to decide whether `--yes` may skip the separate write-time
+    // confirmation below (SPEC §6: never for writes with detected secrets).
     let findings = secrets::scan(&original);
 
     let loaded = context::load(

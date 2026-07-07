@@ -122,8 +122,8 @@ Entrada: argumentos, `-` para stdin, `-f/--file` para arquivos. Saída: resposta
 ## 7. Segurança de arquivos e contexto
 
 - Leitura seletiva: nunca carregar projeto inteiro; ler arquivos citados, limitar por `max_context_bytes` (default 192KiB), truncar com aviso; suporte a `--lines A:B`.
-- Respeitar `.gitignore` (crate `ignore`) + lista própria (config `ignore`) + lista fixa para material de chave/certificado: `*.pem`, `*.key`, `id_rsa*`, `*.pfx`, `credentials*`, `secrets*`. Arquivos `.env*` são permitidos, mas passam pelo scanner de segredos antes de qualquer envio ao modelo.
-- Antes de enviar conteúdo de arquivo: rodar detector de segredos (regexes: AWS keys, tokens `ghp_`, `nvapi-`, private key PEM headers, URLs com senha, JWTs, genéricos `(api_key|secret|password)\s*[:=]`). Se detectar: mostrar o quê/onde e pedir confirmação (ou abortar com `--quiet`).
+- Respeitar `.gitignore` (crate `ignore`) + lista própria (config `ignore`) + lista fixa para material de chave/certificado: `*.pem`, `*.key`, `id_rsa*`, `*.pfx`, `credentials*`, `secrets*`. Arquivos `.env*` são permitidos.
+- Leituras não pedem confirmação extra por conteúdo parecido com segredo; a redação de segredos continua aplicada a logs/erros.
 - Escrita: sempre mostrar diff (`similar`) e pedir confirmação; escrita via arquivo temporário no mesmo diretório + rename atômico; backup prévio para rollback.
 
 ## 8. Cache

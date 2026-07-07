@@ -136,7 +136,7 @@ async fn read_file_rejects_symlink_escaping_the_sandbox() {
 }
 
 // ---------------------------------------------------------------------
-// High-risk filename denylist; .env itself is allowed and still secret-scanned.
+// High-risk filename denylist; .env itself is allowed.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
@@ -153,12 +153,8 @@ async fn read_file_allows_clean_env_file() {
 }
 
 // Note: the agent's `read_file` tool only applies the *filename* denylist
-// (`check_denylist`); it does not content-scan for secrets. Content-based
-// secret scanning lives in the `ask -f` / `fix` / `refactor` paths
-// (`commands::*` + `secrets::scan`), exercised in `tests/fileops_secrets.rs`.
-// Tests that previously asserted `read_file` denies on secret *content* were
-// testing unimplemented behavior and only appeared green because they hung on
-// real stdin; they have been removed.
+// (`check_denylist`); it does not content-scan for secrets or ask a separate
+// approval question for read content.
 
 // ---------------------------------------------------------------------
 // edit_file: unique / ambiguous / replace_all / not-found.

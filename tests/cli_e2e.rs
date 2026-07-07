@@ -314,7 +314,12 @@ async fn ask_reads_prompt_from_stdin() {
 async fn chat_continue_restores_saved_session() {
     let server = MockServer::start(EndpointMode::Ok, EndpointMode::Ok, true).await;
     let config_dir = config_pointing_at(&server.base_url);
-    let config_path = config_dir.path().join("config.toml").to_str().unwrap().to_string();
+    let config_path = config_dir
+        .path()
+        .join("config.toml")
+        .to_str()
+        .unwrap()
+        .to_string();
 
     // First chat: send one message, then /exit. The session is saved on
     // exit. `--plain` keeps us off the TUI path so piped stdin works.

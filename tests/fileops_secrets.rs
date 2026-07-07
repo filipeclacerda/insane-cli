@@ -1,6 +1,5 @@
-//! Atomic writes + backup/rollback round-trip (`fileops.rs`), secret
-//! redaction end-to-end (`error::redact` + `secrets::redact`), and
-//! non-interactive secret-detection abort in `ask -f` (`context.rs`).
+//! Atomic writes + backup/rollback round-trip (`fileops.rs`) and secret
+//! redaction end-to-end (`error::redact` + `secrets::redact`).
 
 #[path = "common/mod.rs"]
 mod common;
@@ -13,6 +12,16 @@ use insane_cli::fileops;
 
 fn insane_cmd() -> Command {
     Command::cargo_bin("insane").expect("binary should build")
+}
+
+fn config_pointing_at(base_url: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        format!("base_url = \"{base_url}\"\n"),
+    )
+    .unwrap();
+    dir
 }
 
 // ---------------------------------------------------------------------
@@ -165,36 +174,35 @@ async fn api_key_never_survives_in_stderr_when_upstream_echoes_it_back() {
 }
 
 // ---------------------------------------------------------------------
-// Secret detection in `ask -f` under non-interactive stdin
+// Secret-like content in `ask -f` no longer opens a confirmation prompt.
 // ---------------------------------------------------------------------
 
-#[test]
-fn ask_dash_f_with_secret_aborts_noninteractively_and_never_prints_it() {
+#[tokio::test(flavor = "multi_thread")]
+async fn ask_dash_f_with_secret_like_content_does_not_abort() {
+    let server = MockServer::start(EndpointMode::Ok, EndpointMode::Ok, true).await;
+    let config_dir = config_pointing_at(&server.base_url);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("has_secret.env");
     let mut f = std::fs::File::create(&path).unwrap();
     writeln!(f, "AWS_KEY=AKIAABCDEFGHIJKLMNOP").unwrap();
     drop(f);
 
-    // `.env`-style files are allowed by filename now; this exercises the
-    // secret-scanner path specifically.
     let mut cmd = insane_cmd();
-    cmd.env("NVIDIA_API_KEY", "nvapi-test-fake-key-000").args([
-        "ask",
-        "explain this",
-        "-f",
-        path.to_str().unwrap(),
-    ]);
+    cmd.current_dir(dir.path())
+        .env("NVIDIA_API_KEY", "nvapi-test-fake-key-000")
+        .args([
+            "--config",
+            config_dir.path().join("config.toml").to_str().unwrap(),
+            "--no-stream",
+            "ask",
+            "explain this",
+            "-f",
+            path.file_name().unwrap().to_str().unwrap(),
+        ]);
     let Some(assert) = common::assert_or_skip(cmd) else {
         return;
     };
-    let assert = assert.failure();
-
-    let output = assert.get_output();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!stdout.contains("AKIAABCDEFGHIJKLMNOP"));
-    assert!(!stderr.contains("AKIAABCDEFGHIJKLMNOP"));
+    assert.success();
 }
 
 #[test]

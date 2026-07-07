@@ -25,8 +25,8 @@ use insane_cli::limiter::RateLimiter;
 use insane_cli::output::OutputOptions;
 use insane_cli::session::Session;
 use insane_cli::tools::permission::Permissions;
-use insane_cli::ui::PlainUi;
 use insane_cli::ui::test_support::FakeUi;
+use insane_cli::ui::PlainUi;
 use insane_cli::AppContext;
 use serde_json::json;
 
@@ -359,16 +359,9 @@ async fn write_file_is_refused_on_non_tty_and_leaves_no_file() {
     let ui = FakeUi::deny();
     let mut permissions = Permissions::with_ui(Box::new(FakeUi::deny()));
 
-    agent::run_turn(
-        &ctx,
-        &mut session,
-        &mut permissions,
-        dir.path(),
-        20,
-        &ui,
-    )
-    .await
-    .expect("turn completes even after a denied write");
+    agent::run_turn(&ctx, &mut session, &mut permissions, dir.path(), 20, &ui)
+        .await
+        .expect("turn completes even after a denied write");
 
     assert!(!dir.path().join("new.txt").exists());
 
@@ -402,16 +395,9 @@ async fn edit_file_is_refused_on_non_tty_and_leaves_file_intact() {
     let ui = FakeUi::deny();
     let mut permissions = Permissions::with_ui(Box::new(FakeUi::deny()));
 
-    agent::run_turn(
-        &ctx,
-        &mut session,
-        &mut permissions,
-        dir.path(),
-        20,
-        &ui,
-    )
-    .await
-    .expect("turn completes even after a denied edit");
+    agent::run_turn(&ctx, &mut session, &mut permissions, dir.path(), 20, &ui)
+        .await
+        .expect("turn completes even after a denied edit");
 
     assert_eq!(
         std::fs::read_to_string(dir.path().join("existing.txt")).unwrap(),
@@ -627,16 +613,9 @@ async fn run_command_is_refused_on_non_tty_and_never_executes() {
     let ui = FakeUi::deny();
     let mut permissions = Permissions::with_ui(Box::new(FakeUi::deny()));
 
-    agent::run_turn(
-        &ctx,
-        &mut session,
-        &mut permissions,
-        dir.path(),
-        20,
-        &ui,
-    )
-    .await
-    .expect("turn completes even after a denied command");
+    agent::run_turn(&ctx, &mut session, &mut permissions, dir.path(), 20, &ui)
+        .await
+        .expect("turn completes even after a denied command");
 
     assert!(
         !marker.exists(),

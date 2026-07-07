@@ -625,11 +625,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("README.md"), "x").unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "x").unwrap();
-        let mut app = AppState::new(
-            "m".into(),
-            ".".into(),
-            dir.path().to_path_buf(),
-        );
+        let mut app = AppState::new("m".into(), ".".into(), dir.path().to_path_buf());
         app.set_input("explain @READ".into());
         // cursor lands at end of input after set_input (13 chars).
         let suggestions = app.suggestions();
@@ -644,11 +640,7 @@ mod tests {
     fn at_mention_requires_at_preceded_by_whitespace() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("README.md"), "x").unwrap();
-        let mut app = AppState::new(
-            "m".into(),
-            ".".into(),
-            dir.path().to_path_buf(),
-        );
+        let mut app = AppState::new("m".into(), ".".into(), dir.path().to_path_buf());
         // `a@READ` mid-word must NOT trigger the file palette.
         app.set_input("contact a@READ".into());
         let suggestions = app.suggestions();
@@ -662,11 +654,7 @@ mod tests {
         std::fs::write(dir.path().join("ignored.txt"), "x").unwrap();
         std::fs::write(dir.path().join("kept.rs"), "x").unwrap();
         std::fs::write(dir.path().join("id_rsa"), "x").unwrap();
-        let mut app = AppState::new(
-            "m".into(),
-            ".".into(),
-            dir.path().to_path_buf(),
-        );
+        let mut app = AppState::new("m".into(), ".".into(), dir.path().to_path_buf());
         app.set_input("@".into());
         let suggestions = app.suggestions();
         let labels: Vec<&str> = suggestions.iter().map(|s| s.label.as_str()).collect();

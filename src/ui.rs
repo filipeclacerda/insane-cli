@@ -283,14 +283,7 @@ pub mod test_support {
             self.answer
         }
         fn tool_trace(&self, _name: &str, _arguments: &str) {}
-        fn tool_summary(
-            &self,
-            _name: &str,
-            _arguments: &str,
-            _result: &str,
-            _elapsed: Duration,
-        ) {
-        }
+        fn tool_summary(&self, _name: &str, _arguments: &str, _result: &str, _elapsed: Duration) {}
         fn warn(&self, _msg: &str) {}
         fn stream_text(&self, _chunk: &str) {}
         fn end_of_stream(&self) {}

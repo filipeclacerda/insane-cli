@@ -52,7 +52,11 @@ async fn run_agent_turn(
     }
 }
 
-pub async fn run(ctx: &AppContext, tools_enabled: bool, continue_last: bool) -> Result<(), ApiError> {
+pub async fn run(
+    ctx: &AppContext,
+    tools_enabled: bool,
+    continue_last: bool,
+) -> Result<(), ApiError> {
     if use_tui(ctx) {
         return crate::tui::run(ctx, tools_enabled, continue_last).await;
     }
@@ -273,10 +277,7 @@ async fn run_plain(
                             ),
                         );
                     } else {
-                        output::log_info(
-                            ctx.out,
-                            "no saved session to resume for this provider",
-                        );
+                        output::log_info(ctx.out, "no saved session to resume for this provider");
                     }
                 }
                 ReplCommand::Tools => {
@@ -353,10 +354,6 @@ async fn run_plain(
 
     // Persist the session so `insane chat --continue` (or `/resume`) can
     // pick it back up. Best-effort: failures are logged inside `save`.
-    session_store::save(
-        &ctx.cfg.active_provider,
-        &session.model,
-        &session.history,
-    );
+    session_store::save(&ctx.cfg.active_provider, &session.model, &session.history);
     Ok(())
 }

@@ -47,7 +47,7 @@ pub async fn run(
     let mut content = String::new();
     for f in files {
         let source = f.to_string_lossy().into_owned();
-        // Selective read + denylist/.gitignore filtering + secret-scan
+        // Selective read + denylist/.gitignore filtering
         // confirmation before any file content is included (SPEC §7).
         let loaded = context::load(
             &source,

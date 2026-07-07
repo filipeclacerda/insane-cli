@@ -58,7 +58,7 @@ insane ask "explique ownership em Rust"
 # Lendo o prompt de stdin
 echo "resuma isto" | insane ask -
 
-# Com arquivo(s) de contexto (ignore/denylist de chaves + secret-scan antes do envio)
+# Com arquivo(s) de contexto (ignore + denylist de chaves/certificados)
 insane ask "onde está o bug?" -f src/main.rs
 
 # Sessão de chat interativa (histórico em memória, trim automático)
@@ -124,7 +124,7 @@ usuário antes de qualquer ação perigosa. Prioridades inalteradas: **seguranç
 | Tool | Parâmetros | Risco | Confirma? |
 |---|---|---|---|
 | `list_files` | `path?`, `max_entries?` | leitura | Não. Respeita `.gitignore` + `ignore` do config + denylist de chaves/certificados; cap de 500 entradas. |
-| `read_file` | `path`, `start_line?`, `end_line?` | leitura → rede | Só se o scanner de segredos encontrar algo no conteúdo. Arquivos `.env` são permitidos, mas continuam passando pelo scanner. |
+| `read_file` | `path`, `start_line?`, `end_line?` | leitura → rede | Não pede confirmação extra por conteúdo. Arquivos `.env` são permitidos; arquivos de chave/certificado seguem bloqueados por nome. |
 | `search_files` | `pattern`, `path?`, `max_results?` | leitura → rede | Igual a `read_file`, aplicado ao resultado do grep (cap de 100 linhas). |
 | `write_file` | `path`, `content` | escrita | **Sempre.** Mostra diff (arquivo novo = diff contra vazio) antes de perguntar. |
 | `edit_file` | `path`, `old_string`, `new_string`, `replace_all?` | escrita | **Sempre.** `old_string` precisa ser único no arquivo, a menos que `replace_all` seja passado; mostra diff antes de perguntar. |
@@ -145,8 +145,7 @@ nunca é tocado.
 
 ### Fluxo de permissões (y/n/a)
 
-Antes de uma escrita, edição, execução de comando, ou uma leitura que
-disparou o scanner de segredos, o CLI pergunta em stderr:
+Antes de uma escrita, edição ou execução de comando, o CLI pergunta em stderr:
 
 ```
 Write to src/main.rs? [y/n/a]
@@ -156,7 +155,7 @@ Write to src/main.rs? [y/n/a]
 - `n` (ou qualquer outra entrada, ou Enter vazio) — recusa. Sempre a resposta
   padrão em terminal não interativo (`stdin` não é um TTY): nunca
   destrutivo por padrão.
-- `a` — aprova esta tool (`write_file`, `edit_file`, ou leituras com segredo)
+- `a` — aprova esta tool (`write_file` ou `edit_file`)
   **para o resto desta sessão de chat**. Para `run_command`, `a` só lembra o
   **comando exato repetido**, nunca "sempre rodar qualquer comando" — não
   existe um `--yolo` e nenhum bypass global foi implementado.
@@ -215,8 +214,7 @@ saltam entre palavras. `Alt+Enter` ou `Shift+Enter` insere uma nova linha.
 As aprovações aparecem no rodapé, no lugar do editor. O painel mostra o
 diff, comando ou alerta de segredo e opções navegáveis com `↑`/`↓`; `Enter`
 confirma e `Esc` recusa. Use `PageUp`/`PageDown` ou a roda do mouse para
-rolar previews longos. Aprovações envolvendo segredos nunca oferecem uma
-opção permanente.
+rolar previews longos.
 
 ### Robustez do loop agêntico
 
@@ -247,9 +245,9 @@ estruturado da API. Para isso:
   slot, um resumo por tool (`✓ read_file agent.rs (14.2 KB, 3ms)` / `✗
   edit_file ... (user denied)`), e uma linha final com métricas do turno
   (`-- 3 rounds | 2 tools | 1.9k tokens | 14s`).
-- Na TUI, o mouse não é capturado pelo app, então você pode selecionar texto
-  no terminal para copiar. Em alguns terminais fullscreen/raw-mode ainda pode
-  ser necessário usar `Shift` ao arrastar.
+- Na TUI, a roda do mouse rola a conversa e previews de aprovação. Como o
+  app captura eventos de mouse para isso, alguns terminais exigem `Shift` ao
+  arrastar para selecionar/copiar texto.
 
 ### Exemplo de sessão (ilustrativo)
 
@@ -382,18 +380,12 @@ na execução atual use `insane --provider lmstudio`; dentro da TUI use
 
 - **Denylist fixa de arquivos de chave/certificado**, sem bypass: `*.pem`,
   `*.key`, `id_rsa*`, `*.pfx`, `credentials*`, `secrets*` nunca são incluídos
-  como contexto, mesmo com `--yes`. Arquivos `.env*` são permitidos, mas
-  passam pelo scanner de segredos antes de qualquer envio ao modelo.
+  como contexto, mesmo com `--yes`. Arquivos `.env*` são permitidos.
 - Respeita `.gitignore` do diretório atual, mais a lista `ignore` do
   `config.toml`.
-- **Detecção de segredos** (regex) antes de qualquer conteúdo de arquivo ir
-  para o modelo: chaves AWS, tokens `ghp_`/`gho_`/`github_pat_`, `nvapi-...`,
-  cabeçalhos de chave privada PEM, JWTs, URLs com senha embutida, e o padrão
-  genérico `(api_key|secret|password|token)\s*[:=]\s*...`. Se algo for
-  encontrado: pede confirmação interativa (mostrando o quê e onde, já
-  redigido); em modo não interativo (`stdin` não é um terminal) ou com
-  `--quiet`, **aborta** em vez de perguntar -- `--yes` não contorna essa
-  confirmação em nenhuma circunstância.
+- Leituras não abrem confirmação extra por conteúdo parecido com segredo.
+  A proteção restante para leitura é o sandbox de diretório, `.gitignore` /
+  `ignore` e a denylist de arquivos de chave/certificado.
 - **Diff + confirmação antes de escrever**: `fix`, `refactor` e `test -o`
   sempre mostram um diff unificado antes de tocar o disco, e só escrevem após
   confirmação explícita (`y`/`yes`) -- em terminal não interativo a resposta
@@ -437,10 +429,6 @@ em `insane status` e em `--json`.
   `id_rsa*`).
   Não há como contornar isso; renomeie/copie o conteúdo necessário para um
   arquivo com outro nome, se apropriado.
-- **"potential secret(s) detected" e o comando aborta sem perguntar**: você
-  está rodando em modo não interativo (`stdin` não é terminal, ou `--quiet`).
-  Rode em um terminal interativo para poder confirmar, ou remova o segredo
-  do arquivo.
 - **`config path` aponta para um lugar inesperado**: o caminho é derivado
   pela crate `directories` a partir do SO; use `--config <path>` para forçar
   um arquivo específico (útil também para testes/CI).

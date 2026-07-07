@@ -92,11 +92,9 @@ impl Cli {
     /// top-level `--no-tools` flag and `--continue`) when none was given
     /// (SPEC-UX A6).
     pub fn resolved_command(&self) -> Command {
-        self.command
-            .clone()
-            .unwrap_or(Command::Chat {
-                continue_last: self.continue_last,
-            })
+        self.command.clone().unwrap_or(Command::Chat {
+            continue_last: self.continue_last,
+        })
     }
 }
 

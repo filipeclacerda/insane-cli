@@ -66,11 +66,7 @@ pub fn save(provider: &str, model: &str, history: &[ChatMessage]) {
     }
 }
 
-fn try_save(
-    provider: &str,
-    model: &str,
-    history: &[ChatMessage],
-) -> std::io::Result<()> {
+fn try_save(provider: &str, model: &str, history: &[ChatMessage]) -> std::io::Result<()> {
     // Drop the leading system message: it's regenerated on resume from
     // the live config, so persisting it would only leak stale
     // instructions (and bloat the file).
@@ -143,7 +139,6 @@ mod tests {
 
     #[test]
     fn save_then_load_roundtrips_model_and_history() {
-        let dir = tempfile::tempdir().unwrap();
         // Redirect the sessions dir via env override is not supported here,
         // so instead exercise the pure helpers by writing through `try_save`
         // into the real cache dir and cleaning up. To keep this hermetic we
@@ -184,10 +179,7 @@ mod tests {
         ];
         try_save(provider, "m", &history).unwrap();
         let loaded = load(provider).unwrap();
-        assert!(loaded
-            .messages
-            .iter()
-            .all(|m| m.role != "system"));
+        assert!(loaded.messages.iter().all(|m| m.role != "system"));
         let _ = clear(provider);
     }
 }

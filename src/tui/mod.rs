@@ -28,6 +28,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -62,7 +63,7 @@ impl TerminalGuard {
     fn enter() -> io::Result<Term> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        crossterm::execute!(stdout, EnterAlternateScreen)?;
+        crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture,)?;
         Terminal::new(CrosstermBackend::new(stdout))
     }
 }
@@ -70,7 +71,12 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
-        let _ = crossterm::execute!(stdout, LeaveAlternateScreen, crossterm::cursor::Show);
+        let _ = crossterm::execute!(
+            stdout,
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            crossterm::cursor::Show,
+        );
         let _ = disable_raw_mode();
     }
 }
@@ -82,7 +88,12 @@ fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let mut stdout = io::stdout();
-        let _ = crossterm::execute!(stdout, LeaveAlternateScreen, crossterm::cursor::Show);
+        let _ = crossterm::execute!(
+            stdout,
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            crossterm::cursor::Show,
+        );
         let _ = disable_raw_mode();
         let redacted = crate::secrets::redact(&crate::error::redact(&info.to_string()));
         eprintln!("{redacted}");
@@ -191,8 +202,7 @@ async fn run_app(
                         }
                         "assistant" => {
                             if let Some(c) = m.content.as_deref() {
-                                st.messages
-                                    .push(app::MsgBlock::Assistant(c.to_string()));
+                                st.messages.push(app::MsgBlock::Assistant(c.to_string()));
                             }
                         }
                         _ => {}
@@ -207,8 +217,7 @@ async fn run_app(
             }
         } else if continue_last {
             st.push_warn(
-                "no saved session to resume for this provider; starting a fresh chat"
-                    .to_string(),
+                "no saved session to resume for this provider; starting a fresh chat".to_string(),
             );
         }
         st.status.spinner_line = Some("loading available models...".to_string());
@@ -301,20 +310,12 @@ async fn run_app(
             .await?;
             // Persist after each turn so a crash/Ctrl+C mid-chat still
             // leaves something for `--continue` to resume. Best-effort.
-            crate::session_store::save(
-                &ctx.cfg.active_provider,
-                &session.model,
-                &session.history,
-            );
+            crate::session_store::save(&ctx.cfg.active_provider, &session.model, &session.history);
         }
     }
 
     // Final save on exit so `insane chat --continue` can resume.
-    crate::session_store::save(
-        &ctx.cfg.active_provider,
-        &session.model,
-        &session.history,
-    );
+    crate::session_store::save(&ctx.cfg.active_provider, &session.model, &session.history);
     Ok(())
 }
 
@@ -572,11 +573,7 @@ fn expand_file_mentions(
 /// Resolves a single `@token` to inline fenced content, applying the same
 /// sandbox/denylist/ignore checks as the `read_file` tool. Returns `None`
 /// for directories or anything that fails a check.
-fn resolve_mention(
-    cwd: &std::path::Path,
-    token: &str,
-    ignore: &[String],
-) -> Option<String> {
+fn resolve_mention(cwd: &std::path::Path, token: &str, ignore: &[String]) -> Option<String> {
     let resolved = crate::tools::sandbox::resolve_in_sandbox(cwd, token).ok()?;
     crate::context::check_denylist(&resolved).ok()?;
     crate::context::check_ignored(&resolved, cwd, ignore).ok()?;
@@ -917,8 +914,7 @@ fn handle_key(
         KeyCode::Tab => {
             let mut st = state.lock().unwrap();
             if let Some(suggestion) = st.selected_suggestion() {
-                let (new_input, new_cursor) =
-                    apply_completion(&st.input, st.cursor, &suggestion);
+                let (new_input, new_cursor) = apply_completion(&st.input, st.cursor, &suggestion);
                 st.set_input(new_input);
                 st.cursor = new_cursor;
                 st.dirty = true;
@@ -1237,8 +1233,7 @@ Shift+Tab=cycle mode  PgUp/PgDn=scroll  Ctrl+End=bottom  Ctrl+C=cancel/exit  Ctr
                             }
                             "assistant" => {
                                 if let Some(c) = m.content.as_deref() {
-                                    st.messages
-                                        .push(app::MsgBlock::Assistant(c.to_string()));
+                                    st.messages.push(app::MsgBlock::Assistant(c.to_string()));
                                 }
                             }
                             _ => {}
@@ -1294,7 +1289,11 @@ mod tests {
 
     #[tokio::test]
     async fn approval_picker_uses_arrows_and_enter() {
-        let state = Arc::new(Mutex::new(AppState::new("m".into(), ".".into(), ".".into())));
+        let state = Arc::new(Mutex::new(AppState::new(
+            "m".into(),
+            ".".into(),
+            ".".into(),
+        )));
         let (tx, rx) = tokio::sync::oneshot::channel();
         state.lock().unwrap().confirm = Some(PendingConfirm {
             req: ConfirmRequest {
@@ -1315,7 +1314,11 @@ mod tests {
 
     #[tokio::test]
     async fn sensitive_approval_never_offers_always() {
-        let state = Arc::new(Mutex::new(AppState::new("m".into(), ".".into(), ".".into())));
+        let state = Arc::new(Mutex::new(AppState::new(
+            "m".into(),
+            ".".into(),
+            ".".into(),
+        )));
         let (tx, rx) = tokio::sync::oneshot::channel();
         state.lock().unwrap().confirm = Some(PendingConfirm {
             req: ConfirmRequest {
@@ -1370,12 +1373,7 @@ mod tests {
             ".".into(),
             dir.path().to_path_buf(),
         )));
-        let expanded = expand_file_mentions(
-            "explain @README.md please",
-            dir.path(),
-            &[],
-            &state,
-        );
+        let expanded = expand_file_mentions("explain @README.md please", dir.path(), &[], &state);
         assert!(expanded.contains("File: README.md"));
         assert!(expanded.contains("# hi"));
         assert!(expanded.contains("please"));
