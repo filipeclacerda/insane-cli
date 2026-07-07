@@ -178,7 +178,7 @@ Dentro do chat, os slash commands além dos existentes
   a troca inicia uma conversa nova para não enviar contexto local à nuvem.
 - `/models` — lista os modelos retornados pelo provider e marca o atual;
   na TUI, `/model ` abre uma lista filtrável e navegável.
-- `/mode <auto|plan|accept-edits>` — troca o modo de interação também
+- `/mode <default|accept-edits|auto>` — troca o modo de interação também
   disponível via `Shift+Tab`.
 - `/tools` — lista as 6 tools e se cada uma está "sempre permitida" nesta
   sessão, mais quantos comandos exatos de `run_command` foram aprovados com
@@ -205,11 +205,10 @@ saltam entre palavras. `Alt+Enter` ou `Shift+Enter` insere uma nova linha.
 
 `Shift+Tab` alterna entre:
 
-- **AUTO** — lê livremente e pede confirmação antes de editar ou executar.
-- **PLAN** — exploração somente leitura; escrita, edição e comandos ficam
-  bloqueados.
+- **DEFAULT** — pede confirmação para edições e comandos.
 - **ACCEPT EDITS** — aprova `write_file`/`edit_file` automaticamente, mas
   comandos shell continuam exigindo confirmação explícita.
+- **AUTO** — executa edições e comandos sem solicitar autorização.
 
 As aprovações aparecem no rodapé, no lugar do editor. O painel mostra o
 diff, comando ou alerta de segredo e opções navegáveis com `↑`/`↓`; `Enter`
@@ -245,9 +244,8 @@ estruturado da API. Para isso:
   slot, um resumo por tool (`✓ read_file agent.rs (14.2 KB, 3ms)` / `✗
   edit_file ... (user denied)`), e uma linha final com métricas do turno
   (`-- 3 rounds | 2 tools | 1.9k tokens | 14s`).
-- Na TUI, a seleção/cópia normal do terminal volta a funcionar porque o app
-  não captura mouse. Para rolar a conversa e os previews, use `PageUp` e
-  `PageDown`.
+- Na TUI, `PageUp`/`PageDown` rolam a conversa e os previews; a roda do mouse
+  também pode ser usada quando o terminal encaminha eventos de scroll.
 
 ### Exemplo de sessão (ilustrativo)
 

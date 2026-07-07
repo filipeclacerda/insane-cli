@@ -13,32 +13,32 @@ use crate::ui::ConfirmRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InteractionMode {
+    Default,
     Auto,
-    Plan,
     AcceptEdits,
 }
 
 impl InteractionMode {
     pub fn next(self) -> Self {
         match self {
-            Self::Auto => Self::Plan,
-            Self::Plan => Self::AcceptEdits,
+            Self::Default => Self::AcceptEdits,
             Self::AcceptEdits => Self::Auto,
+            Self::Auto => Self::Default,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Default => "DEFAULT",
             Self::Auto => "AUTO",
-            Self::Plan => "PLAN",
             Self::AcceptEdits => "ACCEPT EDITS",
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
+            "default" => Some(Self::Default),
             "auto" => Some(Self::Auto),
-            "plan" => Some(Self::Plan),
             "accept-edits" | "accept_edits" | "acceptedits" | "edits" => Some(Self::AcceptEdits),
             _ => None,
         }
@@ -46,10 +46,10 @@ impl InteractionMode {
 
     pub fn system_instruction(self) -> &'static str {
         match self {
-            Self::Auto => "",
-            Self::Plan => {
-                "\n\nInteraction mode: PLAN. Explore with read-only tools and produce a concrete \
-implementation plan. Do not call write_file, edit_file, or run_command, and do not modify the workspace."
+            Self::Default => "",
+            Self::Auto => {
+                "\n\nInteraction mode: AUTO. Execute tool calls directly without waiting for user \
+approval prompts, including file edits and shell commands. Keep working until the request is complete."
             }
             Self::AcceptEdits => {
                 "\n\nInteraction mode: ACCEPT EDITS. File edits are pre-approved for this session. \
@@ -106,7 +106,6 @@ impl PendingConfirm {
 
 #[derive(Debug, Clone, Default)]
 pub struct StatusInfo {
-    pub round: Option<(u32, u32)>,
     pub rate_used: Option<u32>,
     pub rate_capacity: Option<u32>,
     pub min_interval_ms: u64,
@@ -156,7 +155,7 @@ impl AppState {
             models: Vec::new(),
             provider: "nvidia".to_string(),
             providers: Vec::new(),
-            mode: InteractionMode::Auto,
+            mode: InteractionMode::Default,
             cwd_display,
             cwd,
             ignore: Vec::new(),
@@ -307,9 +306,9 @@ impl AppState {
         if let Some(query) = self.input.strip_prefix("/mode ") {
             let query = query.trim().to_ascii_lowercase();
             return [
-                ("auto", "ask before edits and commands"),
-                ("plan", "read-only exploration and planning"),
+                ("default", "ask before edits and commands"),
                 ("accept-edits", "allow edits; ask before commands"),
+                ("auto", "run edits and commands without prompts"),
             ]
             .into_iter()
             .filter(|(mode, _)| mode.contains(&query))

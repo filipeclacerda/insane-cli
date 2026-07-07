@@ -84,8 +84,8 @@ pub fn header_dim() -> Style {
 
 pub fn mode(mode: InteractionMode) -> Style {
     let bg = match mode {
+        InteractionMode::Default => Color::Rgb(71, 85, 105),
         InteractionMode::Auto => Color::Rgb(22, 101, 52),
-        InteractionMode::Plan => Color::Rgb(133, 77, 14),
         InteractionMode::AcceptEdits => Color::Rgb(30, 64, 175),
     };
     Style::default()
@@ -96,8 +96,8 @@ pub fn mode(mode: InteractionMode) -> Style {
 
 pub fn mode_text(mode: InteractionMode) -> Style {
     match mode {
+        InteractionMode::Default => muted(),
         InteractionMode::Auto => success(),
-        InteractionMode::Plan => warning(),
         InteractionMode::AcceptEdits => Style::default().fg(ACCENT).bg(BG),
     }
     .add_modifier(Modifier::BOLD)

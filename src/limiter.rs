@@ -25,6 +25,9 @@ pub struct RateLimiterMetrics {
     pub min_interval_ms: u64,
     pub next_interval_in_ms: u64,
     pub next_request_in_ms: u64,
+    /// Milliseconds until usage falls strictly below 75% of capacity
+    /// (0 when already below, or when capacity is unlimited).
+    pub next_below_75pct_in_ms: u64,
     /// Cumulative milliseconds spent waiting across all `acquire()` calls.
     pub total_waited_ms: u64,
     /// Cumulative number of completed acquires.
@@ -211,6 +214,10 @@ impl RateLimiter {
                     .as_millis() as u64
             })
             .unwrap_or(0);
+        let next_below_75pct_in_ms = self
+            .capacity
+            .map(|capacity| ms_until_below_fraction(&inner.log, now, self.window, capacity, 3, 4))
+            .unwrap_or(0);
         RateLimiterMetrics {
             capacity: self.capacity,
             used,
@@ -219,8 +226,40 @@ impl RateLimiter {
             min_interval_ms: self.min_interval.as_millis() as u64,
             next_interval_in_ms,
             next_request_in_ms: next_slot_in_ms.max(next_interval_in_ms),
+            next_below_75pct_in_ms,
             total_waited_ms: inner.total_waited.as_millis() as u64,
             total_acquired: inner.total_acquired,
+        }
+    }
+
+    /// Waits until the trailing-window usage drops strictly below
+    /// `numerator/denominator` of capacity. Unlimited capacity returns
+    /// immediately.
+    pub async fn wait_until_below_fraction(&self, numerator: usize, denominator: usize) {
+        if self.capacity.is_none() {
+            return;
+        }
+        loop {
+            let wait = {
+                let mut inner = self.inner.lock().await;
+                let now = Instant::now();
+                evict_expired(&mut inner.log, now, self.window);
+                ms_until_below_fraction(
+                    &inner.log,
+                    now,
+                    self.window,
+                    self.capacity.expect("checked above"),
+                    numerator,
+                    denominator,
+                )
+            };
+            if wait == 0 {
+                return;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(wait)) => {}
+                _ = self.notify.notified() => {}
+            }
         }
     }
 }
@@ -233,6 +272,28 @@ fn evict_expired(log: &mut VecDeque<Instant>, now: Instant, window: Duration) {
             break;
         }
     }
+}
+
+fn ms_until_below_fraction(
+    log: &VecDeque<Instant>,
+    now: Instant,
+    window: Duration,
+    capacity: usize,
+    numerator: usize,
+    denominator: usize,
+) -> u64 {
+    let threshold = (capacity * numerator) / denominator;
+    if log.len() < threshold.saturating_add(1) {
+        return 0;
+    }
+    let idx = log.len() - threshold;
+    log.get(idx)
+        .map(|instant| {
+            (*instant + window)
+                .saturating_duration_since(now)
+                .as_millis() as u64
+        })
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

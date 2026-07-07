@@ -256,8 +256,6 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
     let mut spans = Vec::new();
     if let Some(line) = &state.status.spinner_line {
         spans.push(Span::styled(line.clone(), theme::muted()));
-    } else if let Some((r, m)) = state.status.round {
-        spans.push(Span::styled(format!("round {r}/{m}"), theme::muted()));
     }
     if !spans.is_empty() {
         spans.push(Span::styled("  \u{b7}  ", theme::subtle()));
@@ -284,13 +282,12 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
             format!("next {}ms", state.status.next_request_ms),
         );
     }
-    if let Some(tok) = state.status.tokens_this_turn {
-        push_status_part(&mut spans, format!("{tok} tok"));
-    }
-    push_status_part(
-        &mut spans,
-        "Shift+Tab mode  Ctrl+C cancel/exit  /help".to_string(),
-    );
+    let command_hint = if let Some(tok) = state.status.tokens_this_turn {
+        format!("tok {tok}  Shift+Tab mode  Ctrl+C cancel/exit  /help")
+    } else {
+        "tok --  Shift+Tab mode  Ctrl+C cancel/exit  /help".to_string()
+    };
+    push_status_part(&mut spans, command_hint);
     let p = Paragraph::new(Line::from(spans)).style(theme::muted());
     frame.render_widget(p, area);
 }

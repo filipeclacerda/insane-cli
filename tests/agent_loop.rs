@@ -209,15 +209,15 @@ async fn fragmented_stream_arguments_are_accumulated_before_execution() {
 }
 
 // ---------------------------------------------------------------------
-// max_rounds: the model always calls a tool, loop must pause cleanly.
+// max_rounds no longer interrupts the loop; rate limiting governs pacing.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn max_rounds_pauses_an_infinite_tool_calling_loop() {
+async fn low_max_rounds_does_not_interrupt_tool_calling_loop() {
     let dir = tempfile::tempdir().unwrap();
-    const MAX_ROUNDS: u32 = 3;
+    const MAX_ROUNDS: u32 = 2;
 
-    let scripted: Vec<ScriptedResponse> = (0..MAX_ROUNDS)
+    let scripted: Vec<ScriptedResponse> = (0..4u32)
         .map(|i| {
             ScriptedResponse::ToolCalls(vec![ScriptedCall::new(
                 &format!("call_{i}"),
@@ -225,6 +225,7 @@ async fn max_rounds_pauses_an_infinite_tool_calling_loop() {
                 "{}",
             )])
         })
+        .chain(std::iter::once(ScriptedResponse::Text("done".to_string())))
         .collect();
     let server = MockServer::scripted(scripted).await;
 
@@ -242,13 +243,13 @@ async fn max_rounds_pauses_an_infinite_tool_calling_loop() {
     )
     .await;
 
-    let outcome = result.expect("max_rounds should pause the turn, not fail permanently");
-    assert_eq!(outcome.finish_reason.as_deref(), Some("max_rounds"));
-    assert_eq!(outcome.rounds, MAX_ROUNDS);
+    let outcome = result.expect("turn should complete even with a low max_rounds setting");
+    assert_eq!(outcome.finish_reason.as_deref(), Some("stop"));
+    assert_eq!(outcome.rounds, 5);
     assert_eq!(
         server.requests().len(),
-        MAX_ROUNDS as usize,
-        "exactly one request per round, no extra request after giving up"
+        5,
+        "the loop should keep going until the model stops calling tools"
     );
 }
 

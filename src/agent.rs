@@ -1,7 +1,7 @@
 //! Agentic loop (SPEC-AGENT §4, SPEC-UX Part A): streams the model's
 //! response, accumulates tool-call deltas by index, executes tool calls
 //! sequentially with permission prompts, appends `role: "tool"` results, and
-//! repeats until the model stops calling tools or `max_rounds` is hit. A
+//! repeats until the model stops calling tools. A
 //! user turn's Ctrl+C aborts just that turn (back to the chat prompt), never
 //! the process.
 //!
@@ -42,7 +42,7 @@ pub struct TurnOutcome {
     /// The final assistant text produced this turn (empty if the turn ended
     /// on a tool-calls round, or was cancelled).
     pub last_text: String,
-    /// How many rounds the turn took.
+    /// How many model rounds the turn took.
     pub rounds: u32,
     /// How many tool calls were executed this turn.
     pub tools_executed: u32,
@@ -158,14 +158,14 @@ const SPINNER_FRAMES: &[char] = &[
 /// TUI can reuse it without duplicating the wording.
 async fn rate_limit_wait_message(ctx: &AppContext) -> Option<String> {
     let metrics = ctx.limiter.metrics().await;
-    if metrics.next_request_in_ms > 0 {
-        let secs = metrics.next_request_in_ms.div_ceil(1000);
+    if metrics.next_below_75pct_in_ms > 0 {
+        let secs = metrics.next_below_75pct_in_ms.div_ceil(1000);
         let capacity = metrics
             .capacity
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unlimited".to_string());
         Some(format!(
-            "rate limit: waiting {secs}s ({}/{capacity} used)",
+            "rate limit: cooling down {secs}s until usage drops below 75% ({}/{capacity} used)",
             metrics.used
         ))
     } else {
@@ -256,23 +256,19 @@ pub(crate) fn tool_summary_line(
 }
 
 /// Builds the end-of-turn metrics line (SPEC-UX A5), e.g.
-/// `-- 3 rounds | 2 tools | 1.9k tokens | 14s`. Tokens are only shown when
+/// `-- 2 tools | 1.9k tokens | 14s`. Tokens are only shown when
 /// the provider reported `usage` on some round's stream (most NIM/OpenAI-
 /// compatible streaming responses don't, by default); otherwise that segment
 /// is omitted rather than approximated. A pure function so it's directly
 /// unit-testable without capturing stderr.
 pub(crate) fn turn_summary_line(
-    rounds: u32,
+    _rounds: u32,
     tools_executed: u32,
     usage: Option<&Usage>,
     elapsed: Duration,
 ) -> String {
-    let round_word = if rounds == 1 { "round" } else { "rounds" };
     let tool_word = if tools_executed == 1 { "tool" } else { "tools" };
-    let mut parts = vec![
-        format!("{rounds} {round_word}"),
-        format!("{tools_executed} {tool_word}"),
-    ];
+    let mut parts = vec![format!("{tools_executed} {tool_word}")];
     if let Some(u) = usage {
         if u.total_tokens > 0 {
             parts.push(format!("{} tokens", format_token_count(u.total_tokens)));
@@ -347,14 +343,13 @@ fn low_value_tool_preamble(text: &str) -> bool {
 
 /// Runs the agentic loop for a single user turn (SPEC-AGENT §4). Returns
 /// `Ok(TurnOutcome)` when the turn ends normally (model stopped calling
-/// tools, or the user cancelled with Ctrl+C); returns `Err` for API errors
-/// and for hitting `max_rounds`.
+/// tools, or the user cancelled with Ctrl+C); returns `Err` for API errors.
 pub async fn run_turn(
     ctx: &AppContext,
     session: &mut Session,
     permissions: &mut Permissions,
     cwd: &Path,
-    max_rounds: u32,
+    _max_rounds: u32,
     ui: &dyn AgentUi,
 ) -> Result<TurnOutcome, ApiError> {
     let tool_defs = tools::all_tool_defs();
@@ -364,10 +359,12 @@ pub async fn run_turn(
     let mut last_usage: Option<Usage> = None;
     let mut text_call_counter: usize = 0;
 
-    for round in 0..max_rounds {
+    let mut rounds = 0u32;
+    loop {
         if let Some(msg) = rate_limit_wait_message(ctx).await {
             ui.warn(&msg);
         }
+        ctx.limiter.wait_until_below_fraction(3, 4).await;
 
         let req = ChatRequest {
             model: session.model.clone(),
@@ -380,7 +377,7 @@ pub async fn run_turn(
             tool_choice: Some("auto".to_string()),
         };
 
-        let round_outcome = run_round_with_spinner(ctx, req, round, max_rounds, ui).await;
+        let round_outcome = run_round_with_spinner(ctx, req, ui).await;
 
         let Some(round_result) = round_outcome else {
             ui.end_of_stream();
@@ -388,11 +385,12 @@ pub async fn run_turn(
             return Ok(TurnOutcome {
                 finish_reason: None,
                 last_text: String::new(),
-                rounds: round + 1,
+                rounds,
                 tools_executed,
                 usage: last_usage,
             });
         };
+        rounds += 1;
 
         let (mut text, mut tool_calls, finish_reason, usage) = round_result?;
         if usage.is_some() {
@@ -438,7 +436,7 @@ resume"
                 session.push_assistant(text.clone());
             }
             ui.turn_summary(
-                round + 1,
+                rounds,
                 tools_executed,
                 last_usage.as_ref(),
                 turn_start.elapsed(),
@@ -446,7 +444,7 @@ resume"
             return Ok(TurnOutcome {
                 finish_reason,
                 last_text: text,
-                rounds: round + 1,
+                rounds,
                 tools_executed,
                 usage: last_usage,
             });
@@ -487,24 +485,6 @@ resume"
         }
         // Loop continues: next round lets the model see the tool results.
     }
-
-    ui.warn(&format!(
-        "paused: reached agent.max_rounds ({max_rounds}) for this turn; use /continue to keep \
-going, increase `agent.max_rounds`, or simplify the request"
-    ));
-    ui.turn_summary(
-        max_rounds,
-        tools_executed,
-        last_usage.as_ref(),
-        turn_start.elapsed(),
-    );
-    Ok(TurnOutcome {
-        finish_reason: Some("max_rounds".to_string()),
-        last_text: String::new(),
-        rounds: max_rounds,
-        tools_executed,
-        usage: last_usage,
-    })
 }
 
 /// Runs one round while showing a "model thinking..." status via `ui`
@@ -517,8 +497,6 @@ going, increase `agent.max_rounds`, or simplify the request"
 async fn run_round_with_spinner(
     ctx: &AppContext,
     req: ChatRequest,
-    round: u32,
-    max_rounds: u32,
     ui: &dyn AgentUi,
 ) -> Option<Result<(String, Vec<ToolCall>, Option<String>, Option<Usage>), ApiError>> {
     let notify = Arc::new(tokio::sync::Notify::new());
@@ -543,7 +521,7 @@ async fn run_round_with_spinner(
             _ = interval.tick(), if spinner_on => {
                 let frame = SPINNER_FRAMES[frame_i % SPINNER_FRAMES.len()];
                 frame_i += 1;
-                ui.spinner_tick(&format!("{frame} model thinking... (round {}/{})", round + 1, max_rounds));
+                ui.spinner_tick(&format!("{frame} model thinking..."));
             }
         }
     };
@@ -768,7 +746,7 @@ mod tests {
     #[test]
     fn turn_summary_line_reports_rounds_tools_and_duration() {
         let line = turn_summary_line(3, 2, None, Duration::from_secs(14));
-        assert_eq!(line, "-- 3 rounds | 2 tools | 14s");
+        assert_eq!(line, "-- 2 tools | 14s");
     }
 
     #[test]
@@ -779,7 +757,7 @@ mod tests {
             total_tokens: 1900,
         };
         let line = turn_summary_line(3, 2, Some(&usage), Duration::from_secs(14));
-        assert_eq!(line, "-- 3 rounds | 2 tools | 1.9k tokens | 14s");
+        assert_eq!(line, "-- 2 tools | 1.9k tokens | 14s");
     }
 
     #[test]

@@ -126,7 +126,7 @@ async fn run_app(
 
     let mut session = Session::new(model.clone(), ctx.cfg.max_context_bytes);
     if tools_enabled {
-        sync_agent_prompt(ctx, &mut session, &cwd, InteractionMode::Auto);
+        sync_agent_prompt(ctx, &mut session, &cwd, InteractionMode::Default);
     }
 
     // Resume the most recently saved session for this provider, if asked.
@@ -136,7 +136,7 @@ async fn run_app(
             session.model = loaded.model.clone();
             if tools_enabled {
                 session.history.clear();
-                sync_agent_prompt(ctx, &mut session, &cwd, InteractionMode::Auto);
+                sync_agent_prompt(ctx, &mut session, &cwd, InteractionMode::Default);
             } else {
                 session.history.clear();
             }
@@ -419,16 +419,16 @@ fn start_turn<'a>(
 
 fn permission_policy(mode: InteractionMode) -> ApprovalPolicy {
     match mode {
+        InteractionMode::Default => ApprovalPolicy::Default,
         InteractionMode::Auto => ApprovalPolicy::Auto,
-        InteractionMode::Plan => ApprovalPolicy::Plan,
         InteractionMode::AcceptEdits => ApprovalPolicy::AcceptEdits,
     }
 }
 
 fn mode_description(mode: InteractionMode) -> &'static str {
     match mode {
-        InteractionMode::Auto => "asks before edits and commands",
-        InteractionMode::Plan => "read-only exploration and planning",
+        InteractionMode::Default => "asks before edits and commands",
+        InteractionMode::Auto => "runs edits and commands without prompting",
         InteractionMode::AcceptEdits => "file edits allowed; commands still ask",
     }
 }
@@ -1121,7 +1121,7 @@ fn submit_line(
                     state
                         .lock()
                         .unwrap()
-                        .push_warn("usage: /mode <auto|plan|accept-edits>".to_string());
+                        .push_warn("usage: /mode <default|accept-edits|auto>".to_string());
                     return false;
                 };
                 {
@@ -1159,10 +1159,14 @@ Shift+Tab=cycle mode  PgUp/PgDn=scroll  Ctrl+End=bottom  Ctrl+C=cancel/exit  Ctr
                     for def in tools::all_tool_defs() {
                         let name = def.function.name.as_str();
                         let status = match (permissions.policy(), name) {
-                            (ApprovalPolicy::Plan, "write_file" | "edit_file" | "run_command") => {
-                                "blocked in plan mode"
-                            }
+                            (
+                                ApprovalPolicy::Default,
+                                "write_file" | "edit_file" | "run_command",
+                            ) => "asks each time",
                             (ApprovalPolicy::AcceptEdits, "write_file" | "edit_file") => {
+                                "auto-approved"
+                            }
+                            (ApprovalPolicy::Auto, "write_file" | "edit_file" | "run_command") => {
                                 "auto-approved"
                             }
                             _ if always.contains(&name) => "always-allowed",

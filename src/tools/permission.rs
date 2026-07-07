@@ -17,9 +17,9 @@ use crate::ui::{AgentUi, ConfirmRequest, Decision, PlainUi};
 pub enum ApprovalPolicy {
     /// Ask before edits and shell commands.
     #[default]
+    Default,
+    /// Pre-approve everything, including shell commands.
     Auto,
-    /// Reject every action that can mutate the workspace.
-    Plan,
     /// Pre-approve file writes/edits, but continue asking for shell commands.
     AcceptEdits,
 }
@@ -46,7 +46,7 @@ impl Permissions {
         Permissions {
             always_tools: HashSet::new(),
             always_commands: HashSet::new(),
-            policy: ApprovalPolicy::Auto,
+            policy: ApprovalPolicy::Default,
             ui,
         }
     }
@@ -93,9 +93,9 @@ impl Permissions {
     ) -> bool {
         if matches!(tool, "write_file" | "edit_file") {
             match self.policy {
-                ApprovalPolicy::Plan => return false,
+                ApprovalPolicy::Auto => return true,
                 ApprovalPolicy::AcceptEdits => return true,
-                ApprovalPolicy::Auto => {}
+                ApprovalPolicy::Default => {}
             }
         }
         if self.always_tools.contains(tool) {
@@ -124,8 +124,8 @@ impl Permissions {
     /// remembers this exact command string, never shell commands in
     /// general.
     pub async fn confirm_command(&mut self, command: &str) -> bool {
-        if self.policy == ApprovalPolicy::Plan {
-            return false;
+        if self.policy == ApprovalPolicy::Auto {
+            return true;
         }
         if self.always_commands.contains(command) {
             return true;
@@ -204,10 +204,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_mode_rejects_mutations() {
+    async fn auto_mode_skips_file_and_shell_prompts() {
         let mut p = Permissions::with_ui(Box::new(FakeUi::deny()));
-        p.set_policy(ApprovalPolicy::Plan);
-        assert!(!p.confirm("write_file", "write?").await);
-        assert!(!p.confirm_command("echo hi").await);
+        p.set_policy(ApprovalPolicy::Auto);
+        assert!(p.confirm("write_file", "write?").await);
+        assert!(p.confirm_command("echo hi").await);
     }
 }
