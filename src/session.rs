@@ -45,6 +45,8 @@ pub fn parse_command(line: &str) -> Option<Command> {
         Some(Command::SetMode(rest.trim().to_string()))
     } else if trimmed == "/model" {
         Some(Command::SetModel(String::new()))
+    } else if trimmed == "/copy" {
+        Some(Command::Copy)
     } else {
         trimmed
             .strip_prefix("/model ")
@@ -69,6 +71,8 @@ pub enum Command {
     /// the model left off (SPEC-UX A3) -- meant for after a `finish_reason
     /// != stop/tool_calls` (e.g. `length`) cut a response short.
     Continue,
+    /// Copies the last assistant message to the system clipboard.
+    Copy,
     /// Reloads the most recently saved session for the active provider,
     /// replacing the current conversation. Used to recover a chat that was
     /// closed in a previous `insane` invocation.
@@ -80,7 +84,7 @@ pub enum Command {
 /// Text for `/help`: slash commands, shared by line mode and the TUI. The
 /// TUI appends its own keybinding list after this (SPEC-UX B4).
 pub const HELP_COMMANDS: &str =
-    "commands: /provider <name> /providers /model <name> /models /mode <default|plan|accept-edits|auto> /clear /tools /cwd /continue /resume [1-3] /help /exit";
+    "commands: /provider <name> /providers /model <name> /models /mode <default|plan|accept-edits|auto> /clear /tools /cwd /continue /copy /resume [1-3] /help /exit";
 
 /// Metadata used by `/help` and the TUI's live slash-command palette.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +154,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/exit",
         usage: "/exit",
         description: "sair do chat",
+    },
+    SlashCommand {
+        name: "/copy",
+        usage: "/copy",
+        description: "copiar a última mensagem do assistente",
     },
 ];
 
@@ -362,6 +371,7 @@ mod tests {
             parse_command("/continue"),
             Some(Command::Continue)
         ));
+        assert!(matches!(parse_command("/copy"), Some(Command::Copy)));
         assert!(matches!(
             parse_command("/resume"),
             Some(Command::Resume(None))

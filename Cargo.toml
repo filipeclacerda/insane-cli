@@ -41,6 +41,7 @@ sha2 = "0.10"
 async-trait = "0.1"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
+clipboard = "0.5"
 
 [dev-dependencies]
 # Mock NIM server for tests/ (axum, chosen over wiremock/httpmock so the mock

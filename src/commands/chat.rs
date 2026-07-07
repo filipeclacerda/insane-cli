@@ -345,6 +345,31 @@ async fn run_plain(
                         );
                     }
                 }
+                ReplCommand::Copy => {
+                    use clipboard::{ClipboardContext, ClipboardProvider};
+                    if let Some(last_assistant) =
+                        session.history.iter().rev().find(|m| m.role == "assistant")
+                    {
+                        if let Some(content) = &last_assistant.content {
+                            match ClipboardProvider::new()
+                                .and_then(|mut ctx_clip: ClipboardContext| ctx_clip.set_contents(content.clone()))
+                            {
+                                Ok(()) => output::log_info(ctx.out, "Última mensagem do assistente copiada para a área de transferência."),
+                                Err(err) => output::log_info(ctx.out, &format!("Não foi possível copiar para a área de transferência: {err}")),
+                            }
+                        } else {
+                            output::log_info(
+                                ctx.out,
+                                "Última mensagem do assistente não tem conteúdo.",
+                            );
+                        }
+                    } else {
+                        output::log_info(
+                            ctx.out,
+                            "Nenhuma mensagem do assistente encontrada para copiar.",
+                        );
+                    }
+                }
             }
             continue;
         }

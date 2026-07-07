@@ -1419,6 +1419,31 @@ Ctrl+C=cancel/exit  Ctrl+L=clear"
                         permissions.always_allowed_command_count()
                     ));
                 }
+                return false;
+            }
+            ReplCommand::Copy => {
+                use clipboard::{ClipboardContext, ClipboardProvider};
+                if let Some(last_assistant) =
+                    session.history.iter().rev().find(|m| m.role == "assistant")
+                {
+                    if let Some(content) = &last_assistant.content {
+                        match ClipboardProvider::new()
+                            .and_then(|mut ctx_clip: ClipboardContext| ctx_clip.set_contents(content.clone()))
+                        {
+                            Ok(()) => state.lock().unwrap().push_warn("Última mensagem do assistente copiada para a área de transferência".to_string()),
+                            Err(err) => state.lock().unwrap().push_warn(format!("Não foi possível copiar para a área de transferência: {err}")),
+                        }
+                    } else {
+                        state.lock().unwrap().push_warn(
+                            "Última mensagem do assistente não tem conteúdo".to_string(),
+                        );
+                    }
+                } else {
+                    state.lock().unwrap().push_warn(
+                        "Nenhuma mensagem do assistente encontrada para copiar".to_string(),
+                    );
+                }
+                return false;
             }
             ReplCommand::Continue => {
                 if !tools_enabled {
