@@ -65,11 +65,17 @@ pub trait AgentUi: Send + Sync {
     fn warn(&self, msg: &str);
     /// One chunk of the assistant's streamed text.
     fn stream_text(&self, chunk: &str);
+    /// One chunk of provider-supplied reasoning/thinking text.
+    fn stream_thinking(&self, _chunk: &str) {}
     /// Removes the just-streamed assistant text for a tool-calling round when
     /// it was only a low-value preamble ("vou ler alguns arquivos...").
     /// Plain terminals cannot reliably erase already-printed output, so the
     /// default implementation is intentionally a no-op.
     fn discard_last_assistant_message(&self) {}
+    /// Replaces the just-streamed assistant text after a text-encoded tool
+    /// call was recovered. TUI can cleanly remove the JSON/tool-call block;
+    /// plain terminals cannot erase already-printed output, so default no-op.
+    fn replace_last_assistant_message(&self, _text: &str) {}
     /// The assistant's streamed text for this round has ended.
     fn end_of_stream(&self);
     /// Redraws the "waiting for the model" status line/spinner frame.
@@ -219,6 +225,8 @@ impl AgentUi for PlainUi {
     fn stream_text(&self, chunk: &str) {
         crate::output::print_stream_chunk(self.out, chunk);
     }
+
+    fn stream_thinking(&self, _chunk: &str) {}
 
     fn end_of_stream(&self) {
         if self.out.json {

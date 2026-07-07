@@ -207,6 +207,9 @@ pub struct ToolCallDelta {
 #[derive(Debug, Clone, Default)]
 pub struct StreamChunk {
     pub delta: String,
+    /// Provider-supplied reasoning/thinking text, kept separate from the
+    /// assistant reply so it is never saved as conversation content.
+    pub reasoning_delta: String,
     pub tool_calls: Vec<ToolCallDelta>,
     /// Set on the final chunk of a completion (e.g. "stop", "tool_calls",
     /// "length").

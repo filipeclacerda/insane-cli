@@ -100,17 +100,29 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(p, area);
 }
 
-fn block_lines(msg: &MsgBlock, width: usize) -> Vec<Line<'static>> {
+#[derive(Clone)]
+struct StyledSegment {
+    text: String,
+    style: Style,
+}
+
+#[derive(Clone)]
+struct StyledChar {
+    ch: char,
+    style: Style,
+}
+
+fn block_lines(msg: &MsgBlock, width: usize, show_thinking: bool) -> Vec<Line<'static>> {
     match msg {
         MsgBlock::User(text) => wrap_text(&format!("you: {text}"), width)
             .into_iter()
             .map(|l| Line::from(Span::styled(l, theme::user())))
             .collect(),
         MsgBlock::Assistant(text) if text.is_empty() => Vec::new(),
-        MsgBlock::Assistant(text) => wrap_text(&format!("assistant: {text}"), width)
-            .into_iter()
-            .map(|l| Line::from(Span::styled(l, theme::assistant())))
-            .collect(),
+        MsgBlock::Assistant(text) => assistant_lines(text, width),
+        MsgBlock::Thinking(text) if text.trim().is_empty() => Vec::new(),
+        MsgBlock::Thinking(_) if !show_thinking => thinking_placeholder_lines(width),
+        MsgBlock::Thinking(text) => thinking_lines(text, width),
         MsgBlock::Tool { status, line } => {
             let (marker, style) = match status {
                 ToolStatus::Running => ("\u{25c7}", theme::tool_running()),
@@ -137,11 +149,194 @@ fn block_lines(msg: &MsgBlock, width: usize) -> Vec<Line<'static>> {
     }
 }
 
+fn assistant_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    for (idx, raw_line) in text.split('\n').enumerate() {
+        let mut segments = Vec::new();
+        if idx == 0 {
+            segments.push(StyledSegment {
+                text: "insane: ".to_string(),
+                style: theme::assistant(),
+            });
+        }
+        segments.extend(parse_assistant_markup(raw_line));
+        lines.extend(wrap_styled_segments(segments, width));
+    }
+    lines
+}
+
+fn thinking_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    for (idx, raw_line) in text.split('\n').enumerate() {
+        let mut segments = Vec::new();
+        if idx == 0 {
+            segments.push(StyledSegment {
+                text: "thinking: ".to_string(),
+                style: theme::thinking_label(),
+            });
+        }
+        segments.push(StyledSegment {
+            text: raw_line.to_string(),
+            style: theme::thinking(),
+        });
+        lines.extend(wrap_styled_segments(segments, width));
+    }
+    lines
+}
+
+fn thinking_placeholder_lines(width: usize) -> Vec<Line<'static>> {
+    wrap_styled_segments(
+        vec![StyledSegment {
+            text: "thinking...".to_string(),
+            style: theme::thinking_label(),
+        }],
+        width.max(1),
+    )
+}
+
+fn parse_assistant_markup(line: &str) -> Vec<StyledSegment> {
+    let heading_marks = line.chars().take_while(|c| *c == '#').count();
+    if heading_marks >= 2 {
+        let stripped = line[heading_marks..].trim_start();
+        return parse_bold_segments(
+            stripped,
+            theme::assistant_markdown(),
+            theme::assistant_markdown(),
+        );
+    }
+    parse_bold_segments(line, theme::assistant(), theme::assistant_markdown())
+}
+
+fn parse_bold_segments(text: &str, normal: Style, highlight: Style) -> Vec<StyledSegment> {
+    let mut segments = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("**") {
+        let after_open = start + 2;
+        let Some(end_rel) = rest[after_open..].find("**") else {
+            push_segment(&mut segments, rest, normal);
+            return segments;
+        };
+        push_segment(&mut segments, &rest[..start], normal);
+        let end = after_open + end_rel;
+        push_segment(&mut segments, &rest[after_open..end], highlight);
+        rest = &rest[end + 2..];
+    }
+    push_segment(&mut segments, rest, normal);
+    segments
+}
+
+fn push_segment(segments: &mut Vec<StyledSegment>, text: &str, style: Style) {
+    if !text.is_empty() {
+        segments.push(StyledSegment {
+            text: text.to_string(),
+            style,
+        });
+    }
+}
+
+fn wrap_styled_segments(segments: Vec<StyledSegment>, width: usize) -> Vec<Line<'static>> {
+    let mut chars = Vec::new();
+    for segment in segments {
+        for ch in segment.text.chars() {
+            chars.push(StyledChar {
+                ch,
+                style: segment.style,
+            });
+        }
+    }
+    wrap_styled_chars(chars, width)
+}
+
+fn wrap_styled_chars(chars: Vec<StyledChar>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    if chars.is_empty() {
+        return vec![Line::from("")];
+    }
+
+    let mut words = Vec::new();
+    let mut word = Vec::new();
+    let mut separator_style = None;
+    for styled in chars {
+        if styled.ch == ' ' {
+            words.push((separator_style.take(), word));
+            word = Vec::new();
+            separator_style = Some(styled.style);
+        } else {
+            word.push(styled);
+        }
+    }
+    words.push((separator_style, word));
+
+    let mut wrapped = Vec::new();
+    let mut current = Vec::new();
+    for (separator_style, mut word) in words {
+        loop {
+            let candidate_len = if current.is_empty() {
+                word.len()
+            } else {
+                current.len() + 1 + word.len()
+            };
+            if candidate_len <= width {
+                if !current.is_empty() {
+                    current.push(StyledChar {
+                        ch: ' ',
+                        style: separator_style.unwrap_or_else(theme::assistant),
+                    });
+                }
+                current.append(&mut word);
+                break;
+            }
+
+            if current.is_empty() {
+                let tail = word.split_off(width.min(word.len()));
+                wrapped.push(word);
+                if tail.is_empty() {
+                    break;
+                }
+                word = tail;
+                continue;
+            }
+
+            wrapped.push(std::mem::take(&mut current));
+        }
+    }
+    wrapped.push(current);
+    wrapped.into_iter().map(line_from_styled_chars).collect()
+}
+
+fn line_from_styled_chars(chars: Vec<StyledChar>) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut current_style = None;
+    let mut current_text = String::new();
+
+    for styled in chars {
+        match current_style {
+            Some(style) if style == styled.style => current_text.push(styled.ch),
+            Some(style) => {
+                spans.push(Span::styled(std::mem::take(&mut current_text), style));
+                current_style = Some(styled.style);
+                current_text.push(styled.ch);
+            }
+            None => {
+                current_style = Some(styled.style);
+                current_text.push(styled.ch);
+            }
+        }
+    }
+
+    if let Some(style) = current_style {
+        spans.push(Span::styled(current_text, style));
+    }
+    Line::from(spans)
+}
+
 fn draw_conversation(frame: &mut Frame, area: Rect, state: &AppState) {
     let width = area.width.saturating_sub(2).max(1) as usize;
     let mut all_lines: Vec<Line<'static>> = Vec::new();
     for msg in &state.messages {
-        all_lines.extend(block_lines(msg, width));
+        all_lines.extend(block_lines(msg, width, state.show_thinking));
     }
 
     let viewport_height = area.height.saturating_sub(2) as usize;
@@ -212,9 +407,9 @@ fn draw_input(frame: &mut Frame, area: Rect, state: &AppState) {
     let end = (start + inner_height).min(lines.len());
     let text = lines[start..end].join("\n");
     let title = if state.processing {
-        "input (turn in progress -- Ctrl+C to cancel)"
+        "input (turn in progress -- Ctrl+C cancel, Ctrl+O toggle thinking)"
     } else {
-        "input  Enter send  Alt+Enter newline  Shift+Tab mode"
+        "input  Enter send  Alt+Enter newline  Shift+Tab mode  Ctrl+O toggle thinking"
     };
     let p = Paragraph::new(text)
         .style(theme::assistant())
@@ -313,7 +508,8 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
         }
         (None, _) => "tok --".to_string(),
     };
-    let command_hint = format!("{token_text}  Shift+Tab mode  Ctrl+C cancel/exit  /help");
+    let command_hint =
+        format!("{token_text}  Shift+Tab mode  Ctrl+O toggle thinking  Ctrl+C cancel/exit  /help");
     push_status_part(&mut spans, command_hint);
     let p = Paragraph::new(Line::from(spans)).style(theme::muted());
     frame.render_widget(p, area);
@@ -448,12 +644,21 @@ fn draw_session_picker(frame: &mut Frame, area: Rect, picker: &PendingSessionPic
 
 #[cfg(test)]
 mod tests {
-    use super::{draw, input_layout};
+    use super::{assistant_lines, block_lines, draw, input_layout};
     use crate::session_store::SessionSummary;
-    use crate::tui::app::{AppState, PendingConfirm, PendingSessionPicker};
+    use crate::tui::app::{AppState, MsgBlock, PendingConfirm, PendingSessionPicker};
+    use crate::tui::theme;
     use crate::ui::ConfirmRequest;
     use ratatui::backend::TestBackend;
+    use ratatui::text::Line;
     use ratatui::Terminal;
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
 
     #[test]
     fn input_cursor_tracks_middle_and_hard_wrap() {
@@ -496,6 +701,117 @@ mod tests {
             .collect();
         assert!(rendered.contains("approve: edit_file"));
         assert!(rendered.contains("Allow once"));
+    }
+
+    #[test]
+    fn assistant_markdown_heading_is_rendered_without_marker_and_highlighted() {
+        let lines = assistant_lines("## Exemplo", 80);
+        assert_eq!(line_text(&lines[0]), "insane: Exemplo");
+
+        let highlighted: String = lines[0]
+            .spans
+            .iter()
+            .filter(|span| span.style == theme::highlight())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(highlighted, "Exemplo");
+    }
+
+    #[test]
+    fn assistant_markdown_bold_segments_drop_markers() {
+        let lines = assistant_lines("texto **um** e **dois** fim", 80);
+        assert_eq!(line_text(&lines[0]), "insane: texto um e dois fim");
+
+        let highlighted: String = lines[0]
+            .spans
+            .iter()
+            .filter(|span| span.style == theme::highlight())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(highlighted, "umdois");
+    }
+
+    #[test]
+    fn assistant_markdown_incomplete_marker_is_preserved() {
+        let lines = assistant_lines("foo **bar", 80);
+        assert_eq!(line_text(&lines[0]), "insane: foo **bar");
+    }
+
+    #[test]
+    fn indented_hashes_are_not_treated_as_headings() {
+        let lines = assistant_lines("    ## comentario", 80);
+        assert_eq!(line_text(&lines[0]), "insane:     ## comentario");
+    }
+
+    #[test]
+    fn assistant_markdown_markers_are_stripped_in_rendered_conversation() {
+        let mut state = AppState::new("model".into(), ".".into(), ".".into());
+        state.messages.push(MsgBlock::Assistant(
+            "## Plano\nUse **cargo test** agora".into(),
+        ));
+
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(rendered.contains("insane: Plano"));
+        assert!(rendered.contains("Use cargo test agora"));
+        assert!(!rendered.contains("## Plano"));
+        assert!(!rendered.contains("**cargo test**"));
+    }
+
+    #[test]
+    fn thinking_block_shows_placeholder_when_toggled_off() {
+        let mut state = AppState::new("model".into(), ".".into(), ".".into());
+        state
+            .messages
+            .push(MsgBlock::Thinking("private thought".into()));
+        state.show_thinking = false;
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let hidden: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!hidden.contains("private thought"));
+        assert!(hidden.contains("thinking..."));
+
+        state.show_thinking = true;
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let visible: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(visible.contains("thinking: private thought"));
+    }
+
+    #[test]
+    fn thinking_label_and_body_use_distinct_styles() {
+        let lines = block_lines(&MsgBlock::Thinking("private thought".into()), 80, true);
+        assert_eq!(line_text(&lines[0]), "thinking: private thought");
+        assert_eq!(lines[0].spans[0].style, theme::thinking_label());
+        assert_eq!(lines[0].spans[1].style, theme::thinking());
+    }
+
+    #[test]
+    fn thinking_placeholder_uses_label_style() {
+        let lines = block_lines(&MsgBlock::Thinking("private thought".into()), 80, false);
+        assert_eq!(line_text(&lines[0]), "thinking...");
+        assert_eq!(lines[0].spans[0].style, theme::thinking_label());
     }
 
     #[test]

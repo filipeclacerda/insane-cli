@@ -125,6 +125,21 @@ the command is killed if it exceeds its timeout (default and cap 300s).",
     ]
 }
 
+/// Tool definitions allowed while the TUI is in PLAN mode. These let the
+/// model inspect the project and run diagnostic commands, but do not expose
+/// file-writing tools.
+pub fn plan_tool_defs() -> Vec<ToolDef> {
+    all_tool_defs()
+        .into_iter()
+        .filter(|def| {
+            matches!(
+                def.function.name.as_str(),
+                "list_files" | "read_file" | "search_files" | "run_command"
+            )
+        })
+        .collect()
+}
+
 /// Executes a tool call by name, returning a compact JSON string
 /// `{"ok":true,"output":...}` or `{"ok":false,"error":...}` -- this is what
 /// gets sent back as the `role: "tool"` message content. Never panics: any
@@ -215,6 +230,25 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), 6);
+    }
+
+    #[test]
+    fn plan_tool_defs_exclude_write_tools() {
+        let names: Vec<String> = plan_tool_defs()
+            .iter()
+            .map(|def| def.function.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "list_files".to_string(),
+                "read_file".to_string(),
+                "search_files".to_string(),
+                "run_command".to_string(),
+            ]
+        );
+        assert!(!names.iter().any(|name| name == "write_file"));
+        assert!(!names.iter().any(|name| name == "edit_file"));
     }
 
     #[test]

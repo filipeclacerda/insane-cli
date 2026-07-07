@@ -34,6 +34,7 @@ fn chat_req() -> ChatRequest {
         top_p: None,
         max_tokens: None,
         stream: false,
+        stream_options: None,
         tools: None,
         tool_choice: None,
     }

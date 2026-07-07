@@ -54,7 +54,10 @@ pub async fn run(ctx: &AppContext, deep: bool) -> Result<(), ApiError> {
         let mut received = false;
         while let Some(item) = stream.next().await {
             let chunk = item?;
-            if !chunk.delta.is_empty() || !chunk.tool_calls.is_empty() {
+            if !chunk.delta.is_empty()
+                || !chunk.reasoning_delta.is_empty()
+                || !chunk.tool_calls.is_empty()
+            {
                 ttft_ms = Some(started.elapsed().as_millis());
                 received = true;
                 break;

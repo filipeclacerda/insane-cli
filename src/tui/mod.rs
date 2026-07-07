@@ -215,10 +215,12 @@ async fn run_app(
         st.providers = ctx.cfg.providers.keys().cloned().collect();
         st.push_warn(if tools_enabled {
             "insane-cli TUI (tools enabled) -- Enter=send, Ctrl+C=cancel/exit, Ctrl+L=clear, \
-/help"
+Ctrl+O=toggle thinking, /help"
                 .to_string()
         } else {
-            "insane-cli TUI -- Enter=send, Ctrl+C=cancel/exit, Ctrl+L=clear, /help".to_string()
+            "insane-cli TUI -- Enter=send, Ctrl+C=cancel/exit, Ctrl+L=clear, Ctrl+O=toggle thinking, \
+/help"
+                .to_string()
         });
         // Replay the resumed conversation into the visible transcript so the
         // user sees what was said in the previous session (the model already
@@ -387,7 +389,8 @@ async fn run_one_turn(
     terminal: &mut Term,
     last_finish_reason: &mut Option<String>,
 ) -> Result<(), ApiError> {
-    let mut turn_fut = start_turn(ctx, session, permissions, cwd, ui);
+    let mode = state.lock().unwrap().mode;
+    let mut turn_fut = start_turn(ctx, session, permissions, cwd, ui, mode);
 
     loop {
         tokio::select! {
@@ -466,20 +469,34 @@ fn start_turn<'a>(
     permissions: &'a mut Permissions,
     cwd: &'a std::path::Path,
     ui: &'a TuiUi,
+    mode: InteractionMode,
 ) -> TurnFuture<'a> {
-    Box::pin(agent::run_turn(
-        ctx,
-        session,
-        permissions,
-        cwd,
-        ctx.cfg.agent_max_rounds,
-        ui,
-    ))
+    if mode == InteractionMode::Plan {
+        Box::pin(agent::run_turn_with_tool_defs(
+            ctx,
+            session,
+            permissions,
+            cwd,
+            ctx.cfg.agent_max_rounds,
+            ui,
+            tools::plan_tool_defs(),
+        ))
+    } else {
+        Box::pin(agent::run_turn(
+            ctx,
+            session,
+            permissions,
+            cwd,
+            ctx.cfg.agent_max_rounds,
+            ui,
+        ))
+    }
 }
 
 fn permission_policy(mode: InteractionMode) -> ApprovalPolicy {
     match mode {
         InteractionMode::Default => ApprovalPolicy::Default,
+        InteractionMode::Plan => ApprovalPolicy::Default,
         InteractionMode::Auto => ApprovalPolicy::Auto,
         InteractionMode::AcceptEdits => ApprovalPolicy::AcceptEdits,
     }
@@ -488,9 +505,15 @@ fn permission_policy(mode: InteractionMode) -> ApprovalPolicy {
 fn mode_description(mode: InteractionMode) -> &'static str {
     match mode {
         InteractionMode::Default => "asks before edits and commands",
+        InteractionMode::Plan => "can inspect files and run commands; edits disabled",
         InteractionMode::Auto => "runs edits and commands without prompting",
         InteractionMode::AcceptEdits => "file edits allowed; commands still ask",
     }
+}
+
+fn is_ctrl_o(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O'))
 }
 
 fn sync_agent_prompt(
@@ -725,6 +748,10 @@ fn handle_event_while_processing(event: Event, state: &Arc<Mutex<AppState>>) -> 
             if key.kind == crossterm::event::KeyEventKind::Release {
                 return false;
             }
+            if is_ctrl_o(&key) {
+                state.lock().unwrap().toggle_thinking();
+                return false;
+            }
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('d'))
             {
@@ -941,6 +968,11 @@ fn handle_key(
     last_finish_reason: &mut Option<String>,
 ) -> bool {
     if key.kind == crossterm::event::KeyEventKind::Release {
+        return false;
+    }
+
+    if is_ctrl_o(&key) {
+        state.lock().unwrap().toggle_thinking();
         return false;
     }
 
@@ -1317,7 +1349,7 @@ fn submit_line(
                     state
                         .lock()
                         .unwrap()
-                        .push_warn("usage: /mode <default|accept-edits|auto>".to_string());
+                        .push_warn("usage: /mode <default|plan|accept-edits|auto>".to_string());
                     return false;
                 };
                 {
@@ -1342,7 +1374,8 @@ fn submit_line(
                 st.push_warn(HELP_COMMANDS.to_string());
                 st.push_warn(
                     "keys: Enter=send  Alt/Shift+Enter=newline  arrows=edit/navigate  \
-Shift+Tab=cycle mode  PgUp/PgDn=scroll  Ctrl+End=bottom  Ctrl+C=cancel/exit  Ctrl+L=clear"
+Shift+Tab=cycle mode  PgUp/PgDn=scroll  Ctrl+End=bottom  Ctrl+O=toggle thinking  \
+Ctrl+C=cancel/exit  Ctrl+L=clear"
                         .to_string(),
                 );
             }
@@ -1352,24 +1385,32 @@ Shift+Tab=cycle mode  PgUp/PgDn=scroll  Ctrl+End=bottom  Ctrl+C=cancel/exit  Ctr
                     st.push_warn("tools are disabled (--no-tools)".to_string());
                 } else {
                     let always = permissions.always_allowed_tools();
+                    let mode = st.mode;
                     for def in tools::all_tool_defs() {
                         let name = def.function.name.as_str();
-                        let status = match (permissions.policy(), name) {
-                            (
-                                ApprovalPolicy::Default,
-                                "write_file" | "edit_file" | "run_command",
-                            ) => "asks each time",
-                            (ApprovalPolicy::AcceptEdits, "write_file" | "edit_file") => {
-                                "auto-approved"
+                        let status = if mode == InteractionMode::Plan
+                            && matches!(name, "write_file" | "edit_file")
+                        {
+                            "not available in PLAN"
+                        } else {
+                            match (permissions.policy(), name) {
+                                (
+                                    ApprovalPolicy::Default,
+                                    "write_file" | "edit_file" | "run_command",
+                                ) => "asks each time",
+                                (ApprovalPolicy::AcceptEdits, "write_file" | "edit_file") => {
+                                    "auto-approved"
+                                }
+                                (
+                                    ApprovalPolicy::Auto,
+                                    "write_file" | "edit_file" | "run_command",
+                                ) => "auto-approved",
+                                _ if always.contains(&name) => "always-allowed",
+                                _ if matches!(name, "write_file" | "edit_file" | "run_command") => {
+                                    "asks each time"
+                                }
+                                _ => "allowed",
                             }
-                            (ApprovalPolicy::Auto, "write_file" | "edit_file" | "run_command") => {
-                                "auto-approved"
-                            }
-                            _ if always.contains(&name) => "always-allowed",
-                            _ if matches!(name, "write_file" | "edit_file" | "run_command") => {
-                                "asks each time"
-                            }
-                            _ => "allowed",
                         };
                         st.push_warn(format!("  {name} ({status})"));
                     }
@@ -1506,6 +1547,24 @@ mod tests {
         handle_confirm_key(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &state);
         handle_confirm_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &state);
         assert_eq!(rx.await.unwrap(), Decision::No);
+    }
+
+    #[test]
+    fn ctrl_o_toggles_thinking_while_processing() {
+        let state = Arc::new(Mutex::new(AppState::new(
+            "m".into(),
+            ".".into(),
+            ".".into(),
+        )));
+        assert!(state.lock().unwrap().show_thinking);
+
+        let cancel = handle_event_while_processing(
+            Event::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+            &state,
+        );
+
+        assert!(!cancel);
+        assert!(!state.lock().unwrap().show_thinking);
     }
 
     #[test]

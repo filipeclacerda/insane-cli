@@ -6,7 +6,7 @@
 //! to stderr and continuing. Terminates on `data: [DONE]`.
 
 use futures_util::{Stream, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use super::{ChatStream, StreamChunk, ToolCallDelta, Usage};
 use crate::error::ApiError;
@@ -30,8 +30,22 @@ struct RawChoice {
 struct RawDelta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default, deserialize_with = "optional_string")]
+    reasoning_content: Option<String>,
+    #[serde(default, deserialize_with = "optional_string")]
+    reasoning: Option<String>,
+    #[serde(default, deserialize_with = "optional_string")]
+    thinking: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<RawToolCallDelta>>,
+}
+
+fn optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| v.as_str().map(ToString::to_string)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,11 +130,20 @@ where
             Ok(raw) => {
                 let usage = raw.usage;
                 let choice = raw.choices.into_iter().next();
-                let (delta, tool_calls, finish_reason) = match choice {
+                let (delta, reasoning_delta, tool_calls, finish_reason) = match choice {
                     Some(c) => {
-                        let tool_calls = c
-                            .delta
-                            .tool_calls
+                        let RawDelta {
+                            content,
+                            reasoning_content,
+                            reasoning,
+                            thinking,
+                            tool_calls,
+                        } = c.delta;
+                        let reasoning_delta = reasoning_content
+                            .or(reasoning)
+                            .or(thinking)
+                            .unwrap_or_default();
+                        let tool_calls = tool_calls
                             .unwrap_or_default()
                             .into_iter()
                             .map(|t| ToolCallDelta {
@@ -131,15 +154,17 @@ where
                             })
                             .collect();
                         (
-                            c.delta.content.unwrap_or_default(),
+                            content.unwrap_or_default(),
+                            reasoning_delta,
                             tool_calls,
                             c.finish_reason,
                         )
                     }
-                    None => (String::new(), Vec::new(), None),
+                    None => (String::new(), String::new(), Vec::new(), None),
                 };
                 Some(Ok(Some(StreamChunk {
                     delta,
+                    reasoning_delta,
                     tool_calls,
                     finish_reason,
                     usage,
@@ -228,6 +253,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parses_reasoning_delta_separately_from_content() {
+        let input = [
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking...\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n",
+            "data: [DONE]\n",
+        ];
+        let chunks = collect_chunks(parse_sse(bytes_chunks(&input))).await;
+
+        assert_eq!(chunks[0].reasoning_delta, "thinking...");
+        assert_eq!(chunks[0].delta, "");
+        assert_eq!(chunks[1].reasoning_delta, "");
+        assert_eq!(chunks[1].delta, "answer");
+    }
+
+    #[tokio::test]
     async fn ignores_non_data_lines_and_blank_lines() {
         let input = [
             "event: message\n",
@@ -265,6 +305,26 @@ mod tests {
             out.push(item.unwrap());
         }
         out
+    }
+
+    #[tokio::test]
+    async fn parses_reasoning_aliases_when_they_are_strings() {
+        let input = [
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"plan \"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"step \"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"thinking\":\"done\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":{\"text\":\"ignored\"},\"content\":\"ok\"}}]}\n",
+            "data: [DONE]\n",
+        ];
+        let chunks = collect_chunks(parse_sse(bytes_chunks(&input))).await;
+
+        let reasoning: Vec<&str> = chunks
+            .iter()
+            .map(|chunk| chunk.reasoning_delta.as_str())
+            .collect();
+        let text: Vec<&str> = chunks.iter().map(|chunk| chunk.delta.as_str()).collect();
+        assert_eq!(reasoning, vec!["plan ", "step ", "done", ""]);
+        assert_eq!(text, vec!["", "", "", "ok"]);
     }
 
     #[tokio::test]

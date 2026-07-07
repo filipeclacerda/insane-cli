@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 
-use crate::client::{ChatRequest, LlmClient, ToolCall, ToolCallFunction, Usage};
+use crate::client::{ChatRequest, LlmClient, ToolCall, ToolCallFunction, ToolDef, Usage};
 use crate::error::ApiError;
 use crate::session::Session;
 use crate::tools::{self, permission::Permissions, ToolExecCtx};
@@ -385,8 +385,32 @@ pub async fn run_turn(
     _max_rounds: u32,
     ui: &dyn AgentUi,
 ) -> Result<TurnOutcome, ApiError> {
-    let tool_defs = tools::all_tool_defs();
+    run_turn_with_tool_defs(
+        ctx,
+        session,
+        permissions,
+        cwd,
+        _max_rounds,
+        ui,
+        tools::all_tool_defs(),
+    )
+    .await
+}
+
+pub async fn run_turn_with_tool_defs(
+    ctx: &AppContext,
+    session: &mut Session,
+    permissions: &mut Permissions,
+    cwd: &Path,
+    _max_rounds: u32,
+    ui: &dyn AgentUi,
+    tool_defs: Vec<ToolDef>,
+) -> Result<TurnOutcome, ApiError> {
     let known_tools: Vec<&str> = tool_defs.iter().map(|d| d.function.name.as_str()).collect();
+    let all_tool_names: Vec<String> = tools::all_tool_defs()
+        .into_iter()
+        .map(|def| def.function.name)
+        .collect();
     let turn_start = Instant::now();
     let mut tools_executed: u32 = 0;
     let mut turn_usage: Option<Usage> = None;
@@ -427,6 +451,7 @@ pub async fn run_turn(
         rounds += 1;
 
         let (mut text, mut tool_calls, finish_reason, usage) = round_result?;
+        let mut recovered_from_text = false;
         if let Some(usage) = usage {
             add_usage(&mut turn_usage, usage);
         }
@@ -445,8 +470,9 @@ resume"
             && ctx.cfg.lenient_tool_calls
             && finish_reason.as_deref() == Some("stop")
         {
-            if let Some((prefix, call)) = lenient::detect(&text, &known_tools) {
+            if let Some((visible_text, call)) = lenient::detect(&text, &known_tools) {
                 text_call_counter += 1;
+                recovered_from_text = true;
                 let id = format!("text_call_{text_call_counter}");
                 let summary = tools::summarize_args(&call.arguments);
                 ui.warn(&format!(
@@ -461,7 +487,8 @@ resume"
                         arguments: call.arguments,
                     },
                 }];
-                text = prefix;
+                text = visible_text;
+                ui.replace_last_assistant_message(&text);
             }
         }
 
@@ -484,10 +511,10 @@ resume"
             });
         }
 
-        let assistant_content = if low_value_tool_preamble(&text) {
-            ui.discard_last_assistant_message();
+        let assistant_content = if text.is_empty() {
             None
-        } else if text.is_empty() {
+        } else if !recovered_from_text && low_value_tool_preamble(&text) {
+            ui.discard_last_assistant_message();
             None
         } else {
             Some(text)
@@ -498,15 +525,33 @@ resume"
             if !call.id.starts_with("text_call_") {
                 ui.tool_trace(&call.function.name, &call.function.arguments);
             }
-            let mut ectx = ToolExecCtx {
-                cwd: cwd.to_path_buf(),
-                max_context_bytes: ctx.cfg.max_context_bytes,
-                extra_ignore: &ctx.cfg.ignore,
-                permissions,
-            };
             let t0 = Instant::now();
-            let result =
-                tools::execute(&call.function.name, &call.function.arguments, &mut ectx).await;
+            let result = if known_tools.contains(&call.function.name.as_str()) {
+                let mut ectx = ToolExecCtx {
+                    cwd: cwd.to_path_buf(),
+                    max_context_bytes: ctx.cfg.max_context_bytes,
+                    extra_ignore: &ctx.cfg.ignore,
+                    permissions,
+                };
+                tools::execute(&call.function.name, &call.function.arguments, &mut ectx).await
+            } else if all_tool_names
+                .iter()
+                .any(|name| name == &call.function.name)
+            {
+                serde_json::json!({
+                    "ok": false,
+                    "error": format!("tool not available in this mode: {}", call.function.name)
+                })
+                .to_string()
+            } else {
+                let mut ectx = ToolExecCtx {
+                    cwd: cwd.to_path_buf(),
+                    max_context_bytes: ctx.cfg.max_context_bytes,
+                    extra_ignore: &ctx.cfg.ignore,
+                    permissions,
+                };
+                tools::execute(&call.function.name, &call.function.arguments, &mut ectx).await
+            };
             let elapsed = t0.elapsed();
             ui.tool_summary(
                 &call.function.name,
@@ -521,9 +566,9 @@ resume"
     }
 }
 
-/// Runs one round while showing a "model thinking..." status via `ui`
+/// Runs one round while showing a "model working..." status via `ui`
 /// (SPEC-UX A5/B3): a `tokio::time::interval` redraws the spinner frame
-/// every 90ms until the round's `Notify` fires (first delta/tool-call-delta
+/// every 90ms until the round's `Notify` fires (first text/reasoning/tool delta
 /// arrived) or the round completes, whichever is first. Everything happens
 /// in this one task -- no spawned spinner task, so `ui` never needs a
 /// `'static` bound. Returns `None` if Ctrl+C arrived first (SPEC-AGENT §4:
@@ -555,7 +600,7 @@ async fn run_round_with_spinner(
             _ = interval.tick(), if spinner_on => {
                 let frame = SPINNER_FRAMES[frame_i % SPINNER_FRAMES.len()];
                 frame_i += 1;
-                ui.spinner_tick(&format!("{frame} model thinking..."));
+                ui.spinner_tick(&format!("{frame} model working..."));
             }
         }
     };
@@ -569,9 +614,9 @@ async fn run_round_with_spinner(
 /// through `ui.stream_text` (SPEC-UX B0), accumulates tool-call deltas by
 /// `index` (SPEC-AGENT §1/§6), and returns the accumulated text, finalized
 /// tool calls, finish reason, and usage (if the provider reported one).
-/// `notify` is woken the moment the first non-empty delta of any kind
-/// arrives (SPEC-UX A5: clears the "model thinking..." status as soon as
-/// something is happening).
+/// `notify` is woken the moment the first visible delta of any kind arrives
+/// (SPEC-UX A5: clears the "model working..." status as soon as something
+/// is happening).
 async fn stream_round(
     ctx: &AppContext,
     req: ChatRequest,
@@ -589,9 +634,16 @@ async fn stream_round(
 
     while let Some(item) = stream.next().await {
         let chunk = item?;
-        if !notified && (!chunk.delta.is_empty() || !chunk.tool_calls.is_empty()) {
+        if !notified
+            && (!chunk.delta.is_empty()
+                || !chunk.reasoning_delta.is_empty()
+                || !chunk.tool_calls.is_empty())
+        {
             notified = true;
             notify.notify_waiters();
+        }
+        if !chunk.reasoning_delta.is_empty() {
+            ui.stream_thinking(&chunk.reasoning_delta);
         }
         if !chunk.delta.is_empty() {
             ui.stream_text(&chunk.delta);

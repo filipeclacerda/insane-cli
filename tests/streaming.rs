@@ -35,6 +35,7 @@ fn stream_req() -> ChatRequest {
         top_p: None,
         max_tokens: None,
         stream: true,
+        stream_options: None,
         tools: None,
         tool_choice: None,
     }
@@ -131,6 +132,7 @@ async fn client_side_timeout_on_slow_server() {
         top_p: None,
         max_tokens: None,
         stream: false,
+        stream_options: None,
         tools: None,
         tool_choice: None,
     };

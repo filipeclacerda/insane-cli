@@ -24,6 +24,7 @@ use insane_cli::config::{CacheConfig, EffectiveConfig};
 use insane_cli::limiter::RateLimiter;
 use insane_cli::output::OutputOptions;
 use insane_cli::session::Session;
+use insane_cli::tools;
 use insane_cli::tools::permission::Permissions;
 use insane_cli::ui::test_support::FakeUi;
 use insane_cli::ui::PlainUi;
@@ -376,6 +377,47 @@ async fn write_file_is_refused_on_non_tty_and_leaves_no_file() {
 }
 
 #[tokio::test]
+async fn plan_tool_defs_do_not_allow_file_writes_even_if_model_requests_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("plan-should-not-write.txt");
+    let args = json!({"path": "plan-should-not-write.txt", "content": "nope"}).to_string();
+    let server = MockServer::scripted(vec![
+        ScriptedResponse::ToolCalls(vec![ScriptedCall::new("call_w", "write_file", &args)]),
+        ScriptedResponse::Text("Plano sem editar.".to_string()),
+    ])
+    .await;
+
+    let ctx = default_ctx(&server.base_url);
+    let mut session = new_session();
+    let ui = FakeUi::accept();
+    let mut permissions = Permissions::with_ui(Box::new(FakeUi::accept()));
+
+    agent::run_turn_with_tool_defs(
+        &ctx,
+        &mut session,
+        &mut permissions,
+        dir.path(),
+        20,
+        &ui,
+        tools::plan_tool_defs(),
+    )
+    .await
+    .expect("turn completes after disallowed plan-mode write request");
+
+    assert!(!target.exists(), "PLAN mode must not execute write_file");
+    let requests = server.requests();
+    let messages = requests[1]["messages"].as_array().unwrap();
+    let tool_msg = messages.iter().find(|m| m["role"] == "tool").unwrap();
+    let tool_content: serde_json::Value =
+        serde_json::from_str(tool_msg["content"].as_str().unwrap()).unwrap();
+    assert_eq!(tool_content["ok"], false);
+    assert!(tool_content["error"]
+        .as_str()
+        .unwrap()
+        .contains("not available in this mode"));
+}
+
+#[tokio::test]
 async fn edit_file_is_refused_on_non_tty_and_leaves_file_intact() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("existing.txt"), "original content").unwrap();
@@ -554,6 +596,12 @@ async fn tool_call_emitted_as_text_is_recovered_and_executed() {
         .iter()
         .find(|m| m["role"] == "assistant" && m["tool_calls"].is_array())
         .expect("assistant message with recovered tool_calls");
+    let visible_text = assistant_msg["content"]
+        .as_str()
+        .expect("visible text should be preserved beside recovered tool call");
+    assert!(visible_text.contains("Vou ler o arquivo"));
+    assert!(!visible_text.contains("\"name\""));
+    assert!(!visible_text.contains("read_file"));
     assert_eq!(
         assistant_msg["tool_calls"][0]["function"]["name"],
         "read_file"

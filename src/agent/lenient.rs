@@ -5,8 +5,8 @@
 //! calling mechanism. When a round finishes with `finish_reason == "stop"`
 //! and no structured tool calls, `detect` inspects the accumulated text for
 //! one of a few narrow, deliberately conservative shapes and -- only on a
-//! confident match -- returns the announcement text (to keep as the visible
-//! assistant message) plus the recovered tool name/arguments.
+//! confident match -- returns the visible assistant text with the tool-call
+//! markup removed plus the recovered tool name/arguments.
 //!
 //! False positives are treated as worse than false negatives: incidental
 //! JSON in the middle of prose must never trigger this, so every accepted
@@ -30,8 +30,8 @@ pub struct RecoveredCall {
 /// JSON, or a call to a tool that doesn't exist, which must fall through to
 /// the model normally rather than being silently "recovered").
 ///
-/// Returns `(prefix, call)` where `prefix` is the text preceding the
-/// recovered call (to keep as the assistant's visible announcement).
+/// Returns `(visible_text, call)` where `visible_text` is the assistant text
+/// with the recovered call removed.
 pub fn detect(content: &str, known_tools: &[&str]) -> Option<(String, RecoveredCall)> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
@@ -49,8 +49,9 @@ pub fn detect(content: &str, known_tools: &[&str]) -> Option<(String, RecoveredC
         if let Some(end_rel) = content[after..].find("</tool_call>") {
             let inner = content[after..after + end_rel].trim();
             if let Some(call) = try_parse_call(inner, known_tools) {
-                let prefix = content[..pos].trim_end().to_string();
-                return Some((prefix, call));
+                let close_end = after + end_rel + "</tool_call>".len();
+                let visible = join_visible_text(&content[..pos], &content[close_end..]);
+                return Some((visible, call));
             }
         }
     }
@@ -80,6 +81,17 @@ pub fn detect(content: &str, known_tools: &[&str]) -> Option<(String, RecoveredC
     }
 
     None
+}
+
+fn join_visible_text(before: &str, after: &str) -> String {
+    let before = before.trim_end();
+    let after = after.trim_start();
+    match (before.is_empty(), after.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => before.to_string(),
+        (true, false) => after.to_string(),
+        (false, false) => format!("{before}\n{after}"),
+    }
 }
 
 /// Parses `s` as a JSON object shaped like `{"name": <tool>, "arguments":
@@ -175,6 +187,15 @@ mod tests {
             <tool_call>{\"name\": \"search_files\", \"arguments\": {\"pattern\": \"TODO\"}}</tool_call>";
         let (prefix, call) = detect(content, TOOLS).expect("should detect");
         assert!(prefix.contains("search the codebase"));
+        assert_eq!(call.name, "search_files");
+    }
+
+    #[test]
+    fn tagged_block_preserves_visible_text_around_call() {
+        let content = "Antes.\n\
+            <tool_call>{\"name\": \"search_files\", \"arguments\": {\"pattern\": \"TODO\"}}</tool_call>\nDepois.";
+        let (visible, call) = detect(content, TOOLS).expect("should detect");
+        assert_eq!(visible, "Antes.\nDepois.");
         assert_eq!(call.name, "search_files");
     }
 

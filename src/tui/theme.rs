@@ -14,8 +14,10 @@ pub const ACCENT: Color = Color::Rgb(56, 189, 248);
 pub const ACCENT_DARK: Color = Color::Rgb(8, 47, 73);
 pub const SUCCESS: Color = Color::Rgb(74, 222, 128);
 pub const WARNING: Color = Color::Rgb(250, 204, 21);
+pub const HIGHLIGHT: Color = Color::Rgb(251, 146, 60);
 pub const DANGER: Color = Color::Rgb(248, 113, 113);
 pub const PURPLE: Color = Color::Rgb(167, 139, 250);
+pub const THINKING_TEXT: Color = Color::Rgb(71, 85, 105);
 
 pub fn app_bg() -> Style {
     Style::default().fg(TEXT).bg(BG)
@@ -37,6 +39,10 @@ pub fn assistant() -> Style {
     Style::default().fg(TEXT).bg(BG)
 }
 
+pub fn assistant_markdown() -> Style {
+    highlight()
+}
+
 pub fn user() -> Style {
     Style::default()
         .fg(ACCENT)
@@ -46,6 +52,24 @@ pub fn user() -> Style {
 
 pub fn warning() -> Style {
     Style::default().fg(WARNING).bg(BG)
+}
+
+pub fn highlight() -> Style {
+    Style::default()
+        .fg(HIGHLIGHT)
+        .bg(BG)
+        .add_modifier(Modifier::BOLD)
+}
+
+pub fn thinking() -> Style {
+    Style::default().fg(THINKING_TEXT).bg(BG)
+}
+
+pub fn thinking_label() -> Style {
+    Style::default()
+        .fg(WARNING)
+        .bg(BG)
+        .add_modifier(Modifier::BOLD)
 }
 
 pub fn success() -> Style {
@@ -85,6 +109,7 @@ pub fn header_dim() -> Style {
 pub fn mode(mode: InteractionMode) -> Style {
     let bg = match mode {
         InteractionMode::Default => Color::Rgb(71, 85, 105),
+        InteractionMode::Plan => Color::Rgb(180, 83, 9),
         InteractionMode::Auto => Color::Rgb(22, 101, 52),
         InteractionMode::AcceptEdits => Color::Rgb(30, 64, 175),
     };
@@ -97,6 +122,7 @@ pub fn mode(mode: InteractionMode) -> Style {
 pub fn mode_text(mode: InteractionMode) -> Style {
     match mode {
         InteractionMode::Default => muted(),
+        InteractionMode::Plan => warning(),
         InteractionMode::Auto => success(),
         InteractionMode::AcceptEdits => Style::default().fg(ACCENT).bg(BG),
     }

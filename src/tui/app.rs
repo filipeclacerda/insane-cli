@@ -15,6 +15,7 @@ use crate::ui::ConfirmRequest;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InteractionMode {
     Default,
+    Plan,
     Auto,
     AcceptEdits,
 }
@@ -22,7 +23,8 @@ pub enum InteractionMode {
 impl InteractionMode {
     pub fn next(self) -> Self {
         match self {
-            Self::Default => Self::AcceptEdits,
+            Self::Default => Self::Plan,
+            Self::Plan => Self::AcceptEdits,
             Self::AcceptEdits => Self::Auto,
             Self::Auto => Self::Default,
         }
@@ -31,6 +33,7 @@ impl InteractionMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::Default => "DEFAULT",
+            Self::Plan => "PLAN",
             Self::Auto => "AUTO",
             Self::AcceptEdits => "ACCEPT EDITS",
         }
@@ -39,6 +42,7 @@ impl InteractionMode {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "default" => Some(Self::Default),
+            "plan" => Some(Self::Plan),
             "auto" => Some(Self::Auto),
             "accept-edits" | "accept_edits" | "acceptedits" | "edits" => Some(Self::AcceptEdits),
             _ => None,
@@ -48,6 +52,12 @@ impl InteractionMode {
     pub fn system_instruction(self) -> &'static str {
         match self {
             Self::Default => "",
+            Self::Plan => {
+                "\n\nInteraction mode: PLAN. You may inspect the project with read/list/search \
+tools and run diagnostic commands when useful, but do not edit files or write new files. Respond \
+with a concise plan, assumptions, risks, and recommended next steps. If implementation is needed, \
+wait for the user to explicitly ask you to execute it."
+            }
             Self::Auto => {
                 "\n\nInteraction mode: AUTO. Execute tool calls directly without waiting for user \
 approval prompts, including file edits and shell commands. Keep working until the request is complete."
@@ -73,6 +83,9 @@ pub enum MsgBlock {
     User(String),
     /// Assistant text; appended to incrementally while streaming.
     Assistant(String),
+    /// Provider-supplied model reasoning/thinking; shown by default and
+    /// replaced by a compact placeholder when toggled off.
+    Thinking(String),
     /// A tool call trace/result line, e.g. `✓ read_file agent.rs (14.2 KB, 3ms)`.
     Tool {
         status: ToolStatus,
@@ -159,6 +172,7 @@ pub struct AppState {
     pub suggestion_idx: usize,
     /// Lines scrolled up from the bottom of the conversation viewport.
     pub scroll: usize,
+    pub show_thinking: bool,
     pub processing: bool,
     pub status: StatusInfo,
     pub confirm: Option<PendingConfirm>,
@@ -188,6 +202,7 @@ impl AppState {
             history_idx: None,
             suggestion_idx: 0,
             scroll: 0,
+            show_thinking: true,
             processing: false,
             status: StatusInfo::default(),
             confirm: None,
@@ -204,12 +219,44 @@ impl AppState {
     }
 
     pub fn push_assistant_chunk(&mut self, chunk: &str) {
-        if let Some(MsgBlock::Assistant(s)) = self.messages.last_mut() {
-            s.push_str(chunk);
+        let mut append_idx = None;
+        for (idx, msg) in self.messages.iter().enumerate().rev() {
+            match msg {
+                MsgBlock::Assistant(_) => {
+                    append_idx = Some(idx);
+                    break;
+                }
+                MsgBlock::Thinking(_) => {}
+                MsgBlock::User(_)
+                | MsgBlock::Tool { .. }
+                | MsgBlock::Warn(_)
+                | MsgBlock::TurnSummary(_) => break,
+            }
+        }
+
+        if let Some(idx) = append_idx {
+            if let MsgBlock::Assistant(s) = &mut self.messages[idx] {
+                s.push_str(chunk);
+            }
         } else {
             self.messages.push(MsgBlock::Assistant(chunk.to_string()));
         }
         self.dirty = true;
+    }
+
+    pub fn push_thinking_chunk(&mut self, chunk: &str) {
+        if let Some(MsgBlock::Thinking(s)) = self.messages.last_mut() {
+            s.push_str(chunk);
+        } else {
+            self.messages.push(MsgBlock::Thinking(chunk.to_string()));
+        }
+        self.dirty = true;
+    }
+
+    pub fn toggle_thinking(&mut self) -> bool {
+        self.show_thinking = !self.show_thinking;
+        self.dirty = true;
+        self.show_thinking
     }
 
     pub fn discard_last_assistant_message(&mut self) {
@@ -221,6 +268,26 @@ impl AppState {
             self.messages.remove(idx);
             self.dirty = true;
         }
+    }
+
+    pub fn replace_last_assistant_message(&mut self, text: &str) {
+        let last_idx = self
+            .messages
+            .iter()
+            .rposition(|msg| matches!(msg, MsgBlock::Assistant(existing) if !existing.is_empty()));
+        match (last_idx, text.trim().is_empty()) {
+            (Some(idx), true) => {
+                self.messages.remove(idx);
+            }
+            (Some(idx), false) => {
+                self.messages[idx] = MsgBlock::Assistant(text.to_string());
+            }
+            (None, false) => {
+                self.messages.push(MsgBlock::Assistant(text.to_string()));
+            }
+            (None, true) => {}
+        }
+        self.dirty = true;
     }
 
     /// Ensures the *next* streamed chunk starts a fresh assistant message
@@ -330,6 +397,7 @@ impl AppState {
             let query = query.trim().to_ascii_lowercase();
             return [
                 ("default", "ask before edits and commands"),
+                ("plan", "inspect and plan; no edits"),
                 ("accept-edits", "allow edits; ask before commands"),
                 ("auto", "run edits and commands without prompts"),
             ]
@@ -682,6 +750,75 @@ mod tests {
     }
 
     #[test]
+    fn replaces_last_assistant_message_with_cleaned_text() {
+        let mut app = AppState::new("m".into(), ".".into(), ".".into());
+        app.push_assistant_chunk("Vou ler.\n{\"name\":\"read_file\"}");
+        app.start_new_assistant_message_boundary();
+        app.replace_last_assistant_message("Vou ler.");
+
+        assert!(app
+            .messages
+            .iter()
+            .any(|msg| matches!(msg, MsgBlock::Assistant(text) if text == "Vou ler.")));
+        assert!(!app
+            .messages
+            .iter()
+            .any(|msg| matches!(msg, MsgBlock::Assistant(text) if text.contains("read_file"))));
+    }
+
+    #[test]
+    fn thinking_chunks_accumulate_and_visibility_toggles() {
+        let mut app = AppState::new("m".into(), ".".into(), ".".into());
+        assert!(app.show_thinking);
+
+        app.push_thinking_chunk("plan ");
+        app.push_thinking_chunk("step");
+
+        assert!(matches!(
+            app.messages.last(),
+            Some(MsgBlock::Thinking(text)) if text == "plan step"
+        ));
+        assert!(!app.toggle_thinking());
+        assert!(app.toggle_thinking());
+    }
+
+    #[test]
+    fn assistant_chunks_continue_after_interleaved_thinking() {
+        let mut app = AppState::new("m".into(), ".".into(), ".".into());
+        app.push_assistant_chunk("Olá ");
+        app.push_thinking_chunk("plan ");
+        app.push_assistant_chunk("mundo");
+
+        let assistants: Vec<&str> = app
+            .messages
+            .iter()
+            .filter_map(|msg| match msg {
+                MsgBlock::Assistant(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(assistants, vec!["Olá mundo"]);
+    }
+
+    #[test]
+    fn assistant_chunks_do_not_cross_user_boundary() {
+        let mut app = AppState::new("m".into(), ".".into(), ".".into());
+        app.push_assistant_chunk("resposta antiga");
+        app.push_user("nova pergunta".to_string());
+        app.push_assistant_chunk("resposta nova");
+
+        let assistants: Vec<&str> = app
+            .messages
+            .iter()
+            .filter_map(|msg| match msg {
+                MsgBlock::Assistant(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(assistants, vec!["resposta antiga", "resposta nova"]);
+    }
+
+    #[test]
     fn slash_palette_switches_to_model_results() {
         let mut app = AppState::new("current".into(), ".".into(), ".".into());
         app.set_models(vec!["meta/llama".into(), "mistral/nemo".into()]);
@@ -698,6 +835,22 @@ mod tests {
         let suggestions = app.suggestions();
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].value, "/mode accept-edits");
+    }
+
+    #[test]
+    fn slash_palette_suggests_plan_mode() {
+        let mut app = AppState::new("m".into(), ".".into(), ".".into());
+        app.set_input("/mode pl".into());
+        let suggestions = app.suggestions();
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].value, "/mode plan");
+    }
+
+    #[test]
+    fn interaction_mode_parse_and_cycle_include_plan() {
+        assert_eq!(InteractionMode::parse("plan"), Some(InteractionMode::Plan));
+        assert_eq!(InteractionMode::Default.next(), InteractionMode::Plan);
+        assert_eq!(InteractionMode::Plan.next(), InteractionMode::AcceptEdits);
     }
 
     #[test]

@@ -64,9 +64,19 @@ impl AgentUi for TuiUi {
         st.push_assistant_chunk(chunk);
     }
 
+    fn stream_thinking(&self, chunk: &str) {
+        let mut st = self.state.lock().unwrap();
+        st.push_thinking_chunk(chunk);
+    }
+
     fn discard_last_assistant_message(&self) {
         let mut st = self.state.lock().unwrap();
         st.discard_last_assistant_message();
+    }
+
+    fn replace_last_assistant_message(&self, text: &str) {
+        let mut st = self.state.lock().unwrap();
+        st.replace_last_assistant_message(text);
     }
 
     fn end_of_stream(&self) {

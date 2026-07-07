@@ -61,7 +61,7 @@ pub enum Command {
     Models,
     Providers,
     SetProvider(String),
-    /// Changes the TUI interaction mode (`default`, `accept-edits`, `auto`).
+    /// Changes the TUI interaction mode (`default`, `plan`, `accept-edits`, `auto`).
     SetMode(String),
     Tools,
     Cwd,
@@ -80,7 +80,7 @@ pub enum Command {
 /// Text for `/help`: slash commands, shared by line mode and the TUI. The
 /// TUI appends its own keybinding list after this (SPEC-UX B4).
 pub const HELP_COMMANDS: &str =
-    "commands: /provider <name> /providers /model <name> /models /mode <default|accept-edits|auto> /clear /tools /cwd /continue /resume [1-3] /help /exit";
+    "commands: /provider <name> /providers /model <name> /models /mode <default|plan|accept-edits|auto> /clear /tools /cwd /continue /resume [1-3] /help /exit";
 
 /// Metadata used by `/help` and the TUI's live slash-command palette.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,7 +113,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/mode",
-        usage: "/mode <default|accept-edits|auto>",
+        usage: "/mode <default|plan|accept-edits|auto>",
         description: "trocar o modo de interação",
     },
     SlashCommand {
