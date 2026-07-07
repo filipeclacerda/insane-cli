@@ -645,17 +645,20 @@ fn handle_event_while_processing(event: Event, state: &Arc<Mutex<AppState>>) -> 
             false
         }
         Event::Mouse(m) => {
+            // Only handle scroll wheel; ignore button clicks so the terminal
+            // can process them natively (e.g. text selection).
             let mut st = state.lock().unwrap();
             match m.kind {
                 MouseEventKind::ScrollUp => {
                     st.scroll = st.scroll.saturating_add(2);
+                    st.dirty = true;
                 }
                 MouseEventKind::ScrollDown => {
                     st.scroll = st.scroll.saturating_sub(2);
+                    st.dirty = true;
                 }
                 _ => {}
             }
-            st.dirty = true;
             false
         }
         Event::Key(key) => {
@@ -713,6 +716,8 @@ fn handle_event(
             false
         }
         Event::Mouse(m) => {
+            // Only handle scroll wheel; ignore button clicks so the terminal
+            // can process them natively (e.g. text selection).
             let mut st = state.lock().unwrap();
             match m.kind {
                 MouseEventKind::ScrollUp => {
