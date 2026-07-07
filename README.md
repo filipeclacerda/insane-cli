@@ -65,7 +65,9 @@ insane ask "onde está o bug?" -f src/main.rs
 insane chat
 # sem nenhum argumento, `insane` sozinho já roda `chat` (com tools)
 insane
-# dentro do chat: /exit  /clear  /model <nome>  /tools  /cwd  /continue
+# dentro do chat: /exit  /clear  /model <nome>  /tools  /cwd  /continue  /resume
+# retomar a última sessão salva para o provider ativo (modelo + histórico)
+insane chat --continue
 
 # Explicar um arquivo (ou um intervalo de linhas)
 insane explain src/limiter.rs
@@ -188,6 +190,11 @@ Dentro do chat, os slash commands além dos existentes
   por `max_tokens`), reenvia a conversa com a instrução "Continue exactly
   where you stopped." em vez de fazer você reescrever o pedido. Se a última
   rodada terminou normalmente, avisa que não há nada para continuar.
+- `/resume` — recarrega a última sessão salva para o provider ativo,
+  substituindo a conversa atual. Útil para recuperar um chat fechado em uma
+  invocação anterior do `insane`. A sessão é salva automaticamente ao sair
+  do chat (TUI ou plain), e `/clear` remove o arquivo salvo para que um
+  `--continue` posterior não ressuscite uma conversa que você apagou.
 
 ### TUI e modos de interação
 
@@ -298,6 +305,12 @@ diferente de um 5xx/429 real).
 | `--config <path>` | Usa um `config.toml` alternativo |
 | `--no-cache` | Desativa o cache em disco nesta execução |
 | `--yes` | Auto-confirma prompts apenas onde é seguro fazê-lo -- **nunca** substitui a confirmação de escrita quando há segredo detectado |
+
+### `chat` flags
+
+| Flag | Efeito |
+|---|---|
+| `--continue` (alias `--resume`, `--continue-last`) | Recarrega a última sessão salva para o provider ativo, restaurando modelo e histórico. A sessão é salva automaticamente ao sair do chat. |
 
 ## Precedência de configuração
 

@@ -25,6 +25,8 @@ pub fn parse_command(line: &str) -> Option<Command> {
         Some(Command::Cwd)
     } else if trimmed == "/continue" {
         Some(Command::Continue)
+    } else if trimmed == "/resume" {
+        Some(Command::Resume)
     } else if trimmed == "/help" {
         Some(Command::Help)
     } else if trimmed == "/models" {
@@ -65,6 +67,10 @@ pub enum Command {
     /// the model left off (SPEC-UX A3) -- meant for after a `finish_reason
     /// != stop/tool_calls` (e.g. `length`) cut a response short.
     Continue,
+    /// Reloads the most recently saved session for the active provider,
+    /// replacing the current conversation. Used to recover a chat that was
+    /// closed in a previous `insane` invocation.
+    Resume,
     /// Lists available commands and (in the TUI) keybindings (SPEC-UX B4).
     Help,
 }
@@ -72,7 +78,7 @@ pub enum Command {
 /// Text for `/help`: slash commands, shared by line mode and the TUI. The
 /// TUI appends its own keybinding list after this (SPEC-UX B4).
 pub const HELP_COMMANDS: &str =
-    "commands: /provider <name> /providers /model <name> /models /mode <auto|plan|accept-edits> /clear /tools /cwd /continue /help /exit";
+    "commands: /provider <name> /providers /model <name> /models /mode <auto|plan|accept-edits> /clear /tools /cwd /continue /resume /help /exit";
 
 /// Metadata used by `/help` and the TUI's live slash-command palette.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +133,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/continue",
         usage: "/continue",
         description: "continuar uma resposta interrompida",
+    },
+    SlashCommand {
+        name: "/resume",
+        usage: "/resume",
+        description: "retomar a última sessão salva",
     },
     SlashCommand {
         name: "/help",
@@ -280,7 +291,7 @@ impl Session {
     /// `max_context_bytes` (approximated in bytes; SPEC §7). A leading
     /// `system` message is never evicted, and at least one non-system group
     /// is always kept.
-    fn trim(&mut self) {
+    pub fn trim(&mut self) {
         loop {
             if self.total_bytes() <= self.max_context_bytes {
                 break;
@@ -349,6 +360,7 @@ mod tests {
             parse_command("/continue"),
             Some(Command::Continue)
         ));
+        assert!(matches!(parse_command("/resume"), Some(Command::Resume)));
         assert!(matches!(parse_command("/help"), Some(Command::Help)));
         assert!(matches!(parse_command("/models"), Some(Command::Models)));
         assert!(matches!(

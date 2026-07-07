@@ -303,3 +303,72 @@ async fn ask_reads_prompt_from_stdin() {
         .success()
         .stdout(predicate::str::contains("mock response"));
 }
+
+// ---------------------------------------------------------------------
+// chat --continue: a session saved on exit is restored on the next
+// invocation with `--continue`. Uses the plain (non-TTY) chat path by
+// forcing `--plain`, so the test can drive it via piped stdin.
+// ---------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chat_continue_restores_saved_session() {
+    let server = MockServer::start(EndpointMode::Ok, EndpointMode::Ok, true).await;
+    let config_dir = config_pointing_at(&server.base_url);
+    let config_path = config_dir.path().join("config.toml").to_str().unwrap().to_string();
+
+    // First chat: send one message, then /exit. The session is saved on
+    // exit. `--plain` keeps us off the TUI path so piped stdin works.
+    let mut first = insane_cmd();
+    first
+        .env("NVIDIA_API_KEY", FAKE_KEY)
+        .args(["--config", &config_path, "--plain", "chat"])
+        .write_stdin("hello there\n/exit\n");
+    let Some(assert) = common::assert_or_skip(first) else {
+        return;
+    };
+    assert.success();
+
+    // Second chat with --continue: should report a resumed session and
+    // send the restored history (including the first "hello there") to
+    // the server. We verify by inspecting the mock's recorded requests.
+    let mut second = insane_cmd();
+    second
+        .env("NVIDIA_API_KEY", FAKE_KEY)
+        .args(["--config", &config_path, "--plain", "chat", "--continue"])
+        .write_stdin("/exit\n");
+    let Some(assert) = common::assert_or_skip(second) else {
+        return;
+    };
+    let output = assert.success().get_output().clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("resumed session"),
+        "expected resume notice on stderr, got: {stderr}"
+    );
+
+    // The mock recorded at least one request from the resumed chat that
+    // contains the original "hello there" user message.
+    let requests = server.requests();
+    let any_has_hello = requests.iter().any(|req| {
+        req.get("messages")
+            .and_then(|m| m.as_array())
+            .map(|msgs| {
+                msgs.iter().any(|m| {
+                    m.get("role").and_then(|r| r.as_str()) == Some("user")
+                        && m.get("content")
+                            .and_then(|c| c.as_str())
+                            .map(|c| c.contains("hello there"))
+                            .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    });
+    assert!(
+        any_has_hello,
+        "resumed chat should have re-sent the original user message"
+    );
+
+    // Clean up the saved session so it doesn't leak into other tests that
+    // share the same provider name ("nvidia" by default).
+    let _ = insane_cli::session_store::clear("nvidia");
+}

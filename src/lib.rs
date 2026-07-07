@@ -25,6 +25,7 @@ pub mod limiter;
 pub mod output;
 pub mod secrets;
 pub mod session;
+pub mod session_store;
 pub mod tools;
 pub mod tui;
 pub mod ui;
@@ -209,7 +210,9 @@ async fn run_command(cli: &Cli, out: OutputOptions) -> Result<(), ApiError> {
             cache,
             tools,
         } => commands::ask::run(&ctx, prompt.clone(), files, *cache, *tools).await,
-        Command::Chat => commands::chat::run(&ctx, !cli.no_tools).await,
+        Command::Chat { continue_last } => {
+            commands::chat::run(&ctx, !cli.no_tools, *continue_last).await
+        }
         Command::Explain { file, lines } => {
             commands::explain::run(&ctx, file.clone(), lines.clone()).await
         }

@@ -19,6 +19,7 @@ use crate::client::{ChatRequest, LlmClient};
 use crate::error::ApiError;
 use crate::output;
 use crate::session::{self, Command as ReplCommand, Session, CONTINUE_MESSAGE};
+use crate::session_store;
 use crate::tools::{self, permission::Permissions};
 use crate::ui::{AgentUi, PlainUi};
 use crate::AppContext;
@@ -51,14 +52,18 @@ async fn run_agent_turn(
     }
 }
 
-pub async fn run(ctx: &AppContext, tools_enabled: bool) -> Result<(), ApiError> {
+pub async fn run(ctx: &AppContext, tools_enabled: bool, continue_last: bool) -> Result<(), ApiError> {
     if use_tui(ctx) {
-        return crate::tui::run(ctx, tools_enabled).await;
+        return crate::tui::run(ctx, tools_enabled, continue_last).await;
     }
-    run_plain(ctx, tools_enabled).await
+    run_plain(ctx, tools_enabled, continue_last).await
 }
 
-async fn run_plain(ctx: &AppContext, tools_enabled: bool) -> Result<(), ApiError> {
+async fn run_plain(
+    ctx: &AppContext,
+    tools_enabled: bool,
+    continue_last: bool,
+) -> Result<(), ApiError> {
     let model = ctx
         .cli
         .model
@@ -81,6 +86,48 @@ async fn run_plain(ctx: &AppContext, tools_enabled: bool) -> Result<(), ApiError
             &ctx.cfg.system_prompt_extra,
         ));
     }
+
+    // Resume the most recently saved session for this provider, if asked.
+    let resumed = if continue_last {
+        if let Some(loaded) = session_store::load(&ctx.cfg.active_provider) {
+            session.model = loaded.model.clone();
+            // Re-push the system prompt first so the restored history sits
+            // after it (the saved history excludes the system message).
+            if tools_enabled {
+                session.history.clear();
+                session.push_system(agent::system_prompt(
+                    &cwd,
+                    &session.model,
+                    &ctx.cfg.ignore,
+                    &ctx.cfg.system_prompt_extra,
+                ));
+            } else {
+                session.history.clear();
+            }
+            for m in loaded.messages {
+                session.history.push(m);
+            }
+            session.trim();
+            output::log_info(
+                ctx.out,
+                &format!(
+                    "resumed session ({} messages, model {}) -- /exit to quit, /clear to reset",
+                    session.history.len(),
+                    session.model
+                ),
+            );
+            true
+        } else {
+            output::log_info(
+                ctx.out,
+                "no saved session to resume for this provider; starting a fresh chat",
+            );
+            false
+        }
+    } else {
+        false
+    };
+    let _ = resumed;
 
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
@@ -123,6 +170,9 @@ async fn run_plain(ctx: &AppContext, tools_enabled: bool) -> Result<(), ApiError
                 ReplCommand::Exit => break,
                 ReplCommand::Clear => {
                     session.clear();
+                    // Also drop the saved session so a later `--continue`
+                    // doesn't resurrect a conversation the user wiped.
+                    let _ = session_store::clear(&ctx.cfg.active_provider);
                     output::log_info(ctx.out, "history cleared");
                 }
                 ReplCommand::SetModel(m) => {
@@ -193,6 +243,40 @@ async fn run_plain(ctx: &AppContext, tools_enabled: bool) -> Result<(), ApiError
                         session.push_user(CONTINUE_MESSAGE.to_string());
                         last_finish_reason =
                             run_agent_turn(ctx, &mut session, &mut permissions, &cwd, &ui).await;
+                    }
+                }
+                ReplCommand::Resume => {
+                    if let Some(loaded) = session_store::load(&ctx.cfg.active_provider) {
+                        session.model = loaded.model.clone();
+                        if tools_enabled {
+                            session.history.clear();
+                            session.push_system(agent::system_prompt(
+                                &cwd,
+                                &session.model,
+                                &ctx.cfg.ignore,
+                                &ctx.cfg.system_prompt_extra,
+                            ));
+                        } else {
+                            session.history.clear();
+                        }
+                        for m in loaded.messages {
+                            session.history.push(m);
+                        }
+                        session.trim();
+                        last_finish_reason = None;
+                        output::log_info(
+                            ctx.out,
+                            &format!(
+                                "resumed session ({} messages, model {})",
+                                session.history.len(),
+                                session.model
+                            ),
+                        );
+                    } else {
+                        output::log_info(
+                            ctx.out,
+                            "no saved session to resume for this provider",
+                        );
                     }
                 }
                 ReplCommand::Tools => {
@@ -267,5 +351,12 @@ async fn run_plain(ctx: &AppContext, tools_enabled: bool) -> Result<(), ApiError
         }
     }
 
+    // Persist the session so `insane chat --continue` (or `/resume`) can
+    // pick it back up. Best-effort: failures are logged inside `save`.
+    session_store::save(
+        &ctx.cfg.active_provider,
+        &session.model,
+        &session.history,
+    );
     Ok(())
 }

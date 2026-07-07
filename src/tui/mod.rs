@@ -93,20 +93,27 @@ fn install_panic_hook() {
 type TurnFuture<'a> = Pin<Box<dyn Future<Output = Result<TurnOutcome, ApiError>> + Send + 'a>>;
 
 /// Entry point (SPEC-UX B1). `tools_enabled` mirrors `commands::chat::run`.
-pub async fn run(ctx: &AppContext, tools_enabled: bool) -> Result<(), ApiError> {
+/// `continue_last` resumes the most recently saved session for the active
+/// provider, if one exists.
+pub async fn run(
+    ctx: &AppContext,
+    tools_enabled: bool,
+    continue_last: bool,
+) -> Result<(), ApiError> {
     install_panic_hook();
     let mut terminal = TerminalGuard::enter()
         .map_err(|e| ApiError::permanent(format!("failed to start TUI: {e}")))?;
     let _guard = TerminalGuard;
 
     let mut local_ctx = ctx.clone();
-    let result = run_app(&mut local_ctx, tools_enabled, &mut terminal).await;
+    let result = run_app(&mut local_ctx, tools_enabled, continue_last, &mut terminal).await;
     result
 }
 
 async fn run_app(
     ctx: &mut AppContext,
     tools_enabled: bool,
+    continue_last: bool,
     terminal: &mut Term,
 ) -> Result<(), ApiError> {
     let model = ctx
@@ -122,8 +129,27 @@ async fn run_app(
         sync_agent_prompt(ctx, &mut session, &cwd, InteractionMode::Auto);
     }
 
+    // Resume the most recently saved session for this provider, if asked.
+    let mut did_resume = false;
+    if continue_last {
+        if let Some(loaded) = crate::session_store::load(&ctx.cfg.active_provider) {
+            session.model = loaded.model.clone();
+            if tools_enabled {
+                session.history.clear();
+                sync_agent_prompt(ctx, &mut session, &cwd, InteractionMode::Auto);
+            } else {
+                session.history.clear();
+            }
+            for m in loaded.messages {
+                session.history.push(m);
+            }
+            session.trim();
+            did_resume = true;
+        }
+    }
+
     let state = Arc::new(Mutex::new(AppState::new(
-        model,
+        session.model.clone(),
         cwd_display,
         cwd.clone(),
     )));
@@ -146,6 +172,45 @@ async fn run_app(
         } else {
             "insane-cli TUI -- Enter=send, Ctrl+C=cancel/exit, Ctrl+L=clear, /help".to_string()
         });
+        // Replay the resumed conversation into the visible transcript so the
+        // user sees what was said in the previous session (the model already
+        // has the raw history; this is purely for the on-screen transcript).
+        if did_resume {
+            if session.history.iter().any(|m| m.role != "system") {
+                st.push_warn(format!(
+                    "resumed session ({} messages, model {}) -- /exit to quit, /clear to reset",
+                    session.history.len(),
+                    session.model
+                ));
+                for m in &session.history {
+                    match m.role.as_str() {
+                        "user" => {
+                            if let Some(c) = m.content.as_deref() {
+                                st.messages.push(app::MsgBlock::User(c.to_string()));
+                            }
+                        }
+                        "assistant" => {
+                            if let Some(c) = m.content.as_deref() {
+                                st.messages
+                                    .push(app::MsgBlock::Assistant(c.to_string()));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                st.dirty = true;
+            } else {
+                st.push_warn(
+                    "no saved session to resume for this provider; starting a fresh chat"
+                        .to_string(),
+                );
+            }
+        } else if continue_last {
+            st.push_warn(
+                "no saved session to resume for this provider; starting a fresh chat"
+                    .to_string(),
+            );
+        }
         st.status.spinner_line = Some("loading available models...".to_string());
     }
 
@@ -234,9 +299,22 @@ async fn run_app(
                 &mut last_finish_reason,
             )
             .await?;
+            // Persist after each turn so a crash/Ctrl+C mid-chat still
+            // leaves something for `--continue` to resume. Best-effort.
+            crate::session_store::save(
+                &ctx.cfg.active_provider,
+                &session.model,
+                &session.history,
+            );
         }
     }
 
+    // Final save on exit so `insane chat --continue` can resume.
+    crate::session_store::save(
+        &ctx.cfg.active_provider,
+        &session.model,
+        &session.history,
+    );
     Ok(())
 }
 
@@ -584,18 +662,10 @@ fn handle_event_while_processing(event: Event, state: &Arc<Mutex<AppState>>) -> 
             let mut st = state.lock().unwrap();
             match m.kind {
                 MouseEventKind::ScrollUp => {
-                    if let Some(pending) = st.confirm.as_mut() {
-                        pending.scroll = pending.scroll.saturating_sub(2);
-                    } else {
-                        st.scroll = st.scroll.saturating_add(2);
-                    }
+                    st.scroll = st.scroll.saturating_add(2);
                 }
                 MouseEventKind::ScrollDown => {
-                    if let Some(pending) = st.confirm.as_mut() {
-                        pending.scroll = pending.scroll.saturating_add(2);
-                    } else {
-                        st.scroll = st.scroll.saturating_sub(2);
-                    }
+                    st.scroll = st.scroll.saturating_sub(2);
                 }
                 _ => {}
             }
@@ -967,6 +1037,9 @@ fn submit_line(
             ReplCommand::Clear => {
                 session.clear();
                 state.lock().unwrap().clear_conversation();
+                // Also drop the saved session so a later `--continue`
+                // doesn't resurrect a conversation the user wiped.
+                let _ = crate::session_store::clear(&ctx.cfg.active_provider);
                 return false;
             }
             ReplCommand::SetModel(m) => {
@@ -1137,6 +1210,53 @@ Shift+Tab=cycle mode  PgUp/PgDn=scroll  Ctrl+End=bottom  Ctrl+C=cancel/exit  Ctr
                     st.processing = true;
                     return true;
                 }
+            }
+            ReplCommand::Resume => {
+                if let Some(loaded) = crate::session_store::load(&ctx.cfg.active_provider) {
+                    session.model = loaded.model.clone();
+                    if tools_enabled {
+                        session.history.clear();
+                        sync_agent_prompt(ctx, session, cwd, state.lock().unwrap().mode);
+                    } else {
+                        session.history.clear();
+                    }
+                    let mut st = state.lock().unwrap();
+                    st.model = session.model.clone();
+                    st.clear_conversation();
+                    st.push_warn(format!(
+                        "resumed session ({} messages, model {})",
+                        loaded.messages.len(),
+                        session.model
+                    ));
+                    for m in &loaded.messages {
+                        match m.role.as_str() {
+                            "user" => {
+                                if let Some(c) = m.content.as_deref() {
+                                    st.messages.push(app::MsgBlock::User(c.to_string()));
+                                }
+                            }
+                            "assistant" => {
+                                if let Some(c) = m.content.as_deref() {
+                                    st.messages
+                                        .push(app::MsgBlock::Assistant(c.to_string()));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    for m in loaded.messages {
+                        session.history.push(m);
+                    }
+                    session.trim();
+                    *last_finish_reason = None;
+                    st.dirty = true;
+                } else {
+                    state
+                        .lock()
+                        .unwrap()
+                        .push_warn("no saved session to resume for this provider".to_string());
+                }
+                return false;
             }
         }
         return false;
