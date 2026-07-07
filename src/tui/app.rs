@@ -131,6 +131,9 @@ pub struct AppState {
     pub input: String,
     /// Cursor position within `input`, in chars.
     pub cursor: usize,
+    /// Enter-to-submit is delayed by one render tick so terminals that emit
+    /// pasted newlines as Enter key events can still keep multiline paste intact.
+    pub pending_submit: Option<String>,
     pub input_history: Vec<String>,
     /// Index into `input_history` while browsing with Up/Down; `None` means
     /// "not currently browsing" (editing the live input).
@@ -162,6 +165,7 @@ impl AppState {
             messages: Vec::new(),
             input: String::new(),
             cursor: 0,
+            pending_submit: None,
             input_history: Vec::new(),
             history_idx: None,
             suggestion_idx: 0,
@@ -469,6 +473,18 @@ impl AppState {
         self.dirty = true;
     }
 
+    pub fn insert_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let byte_idx = byte_index_for_char(&self.input, self.cursor);
+        self.input.insert_str(byte_idx, text);
+        self.cursor += text.chars().count();
+        self.history_idx = None;
+        self.reset_suggestion();
+        self.dirty = true;
+    }
+
     pub fn insert_newline(&mut self) {
         self.insert_char('\n');
     }
@@ -481,6 +497,30 @@ impl AppState {
         let start = byte_index_for_char(&self.input, self.cursor - 1);
         self.input.replace_range(start..end, "");
         self.cursor -= 1;
+        self.reset_suggestion();
+        self.dirty = true;
+    }
+
+    pub fn backspace_word(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+
+        let chars: Vec<char> = self.input.chars().collect();
+        let end_cursor = self.cursor;
+        let mut start_cursor = end_cursor;
+        while start_cursor > 0 && chars[start_cursor - 1].is_whitespace() {
+            start_cursor -= 1;
+        }
+        while start_cursor > 0 && !chars[start_cursor - 1].is_whitespace() {
+            start_cursor -= 1;
+        }
+
+        let start = byte_index_for_char(&self.input, start_cursor);
+        let end = byte_index_for_char(&self.input, end_cursor);
+        self.input.replace_range(start..end, "");
+        self.cursor = start_cursor;
+        self.history_idx = None;
         self.reset_suggestion();
         self.dirty = true;
     }
@@ -576,6 +616,25 @@ mod tests {
         assert_eq!(app.input, "olXá");
         app.backspace();
         assert_eq!(app.input, "olá");
+    }
+
+    #[test]
+    fn backspace_word_deletes_previous_word_and_padding() {
+        let mut app = AppState::new("m".into(), ".".into(), ".".into());
+        app.set_input("alpha beta   ".into());
+        app.backspace_word();
+        assert_eq!(app.input, "alpha ");
+        assert_eq!(app.cursor, "alpha ".chars().count());
+    }
+
+    #[test]
+    fn backspace_word_deletes_at_cursor_across_multiline_input() {
+        let mut app = AppState::new("m".into(), ".".into(), ".".into());
+        app.set_input("one two\nthree four".into());
+        app.cursor = "one two\nthree".chars().count();
+        app.backspace_word();
+        assert_eq!(app.input, "one two\n four");
+        assert_eq!(app.cursor, "one two\n".chars().count());
     }
 
     #[test]

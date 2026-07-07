@@ -28,7 +28,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
+    KeyModifiers, MouseEventKind,
+};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -62,7 +65,7 @@ impl TerminalGuard {
     fn enter() -> io::Result<Term> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        crossterm::execute!(stdout, EnterAlternateScreen)?;
+        crossterm::execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
         Terminal::new(CrosstermBackend::new(stdout))
     }
 }
@@ -70,7 +73,12 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
-        let _ = crossterm::execute!(stdout, LeaveAlternateScreen, crossterm::cursor::Show,);
+        let _ = crossterm::execute!(
+            stdout,
+            DisableBracketedPaste,
+            LeaveAlternateScreen,
+            crossterm::cursor::Show,
+        );
         let _ = disable_raw_mode();
     }
 }
@@ -82,7 +90,12 @@ fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let mut stdout = io::stdout();
-        let _ = crossterm::execute!(stdout, LeaveAlternateScreen, crossterm::cursor::Show,);
+        let _ = crossterm::execute!(
+            stdout,
+            DisableBracketedPaste,
+            LeaveAlternateScreen,
+            crossterm::cursor::Show,
+        );
         let _ = disable_raw_mode();
         let redacted = crate::secrets::redact(&crate::error::redact(&info.to_string()));
         eprintln!("{redacted}");
@@ -264,7 +277,6 @@ async fn run_app(
                             &mut permissions,
                             &cwd,
                             tools_enabled,
-                            &mut last_finish_reason,
                         );
                     }
                     Some(Err(_)) | None => {
@@ -275,6 +287,18 @@ async fn run_app(
 
             _ = render_tick.tick() => {
                 refresh_rate_status(ctx, &state).await;
+                if let Some(line) = take_pending_submit(&state) {
+                    start_turn_now = submit_line(
+                        line,
+                        ctx,
+                        &state,
+                        &mut session,
+                        &mut permissions,
+                        &cwd,
+                        tools_enabled,
+                        &mut last_finish_reason,
+                    );
+                }
                 let dirty = state.lock().unwrap().dirty;
                 if dirty {
                     render(terminal, &state)?;
@@ -708,7 +732,6 @@ fn handle_event(
     permissions: &mut Permissions,
     cwd: &std::path::Path,
     tools_enabled: bool,
-    last_finish_reason: &mut Option<String>,
 ) -> bool {
     match event {
         Event::Resize(_, _) => {
@@ -740,18 +763,27 @@ fn handle_event(
             }
             false
         }
-        Event::Key(key) => handle_key(
-            key,
-            ctx,
-            state,
-            session,
-            permissions,
-            cwd,
-            tools_enabled,
-            last_finish_reason,
-        ),
+        Event::Key(key) => handle_key(key, ctx, state, session, permissions, cwd, tools_enabled),
+        Event::Paste(text) => {
+            let mut st = state.lock().unwrap();
+            restore_pending_submit_as_input(&mut st);
+            st.insert_text(&text.replace("\r\n", "\n").replace('\r', "\n"));
+            false
+        }
         _ => false,
     }
+}
+
+fn take_pending_submit(state: &Arc<Mutex<AppState>>) -> Option<String> {
+    state.lock().unwrap().pending_submit.take()
+}
+
+fn restore_pending_submit_as_input(st: &mut AppState) {
+    let Some(line) = st.pending_submit.take() else {
+        return;
+    };
+    st.set_input(line);
+    st.insert_newline();
 }
 
 /// Returns `true` when a line was just submitted and a turn should now be
@@ -765,7 +797,6 @@ fn handle_key(
     permissions: &mut Permissions,
     cwd: &std::path::Path,
     tools_enabled: bool,
-    last_finish_reason: &mut Option<String>,
 ) -> bool {
     if key.kind == crossterm::event::KeyEventKind::Release {
         return false;
@@ -828,10 +859,19 @@ fn handle_key(
     match key.code {
         KeyCode::Enter if alt_or_shift_enter => {
             let mut st = state.lock().unwrap();
+            restore_pending_submit_as_input(&mut st);
             st.insert_newline();
             false
         }
         KeyCode::Enter => {
+            {
+                let mut st = state.lock().unwrap();
+                if st.pending_submit.is_some() {
+                    restore_pending_submit_as_input(&mut st);
+                    st.insert_newline();
+                    return false;
+                }
+            }
             let line = {
                 let mut st = state.lock().unwrap();
                 if let Some(suggestion) = st.selected_suggestion() {
@@ -852,21 +892,20 @@ fn handle_key(
             if line.trim().is_empty() {
                 false
             } else {
-                submit_line(
-                    line,
-                    ctx,
-                    state,
-                    session,
-                    permissions,
-                    cwd,
-                    tools_enabled,
-                    last_finish_reason,
-                )
+                state.lock().unwrap().pending_submit = Some(line);
+                false
             }
         }
         KeyCode::Backspace => {
             let mut st = state.lock().unwrap();
-            st.backspace();
+            restore_pending_submit_as_input(&mut st);
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                || key.modifiers.contains(KeyModifiers::ALT)
+            {
+                st.backspace_word();
+            } else {
+                st.backspace();
+            }
             false
         }
         KeyCode::Delete => {
@@ -998,6 +1037,7 @@ fn handle_key(
         }
         KeyCode::Char(c) => {
             let mut st = state.lock().unwrap();
+            restore_pending_submit_as_input(&mut st);
             st.insert_char(c);
             false
         }
@@ -1360,6 +1400,18 @@ mod tests {
         let (new_input, new_cursor) = apply_completion("/mod", 4, &suggestion);
         assert_eq!(new_input, "/model meta/llama ");
         assert_eq!(new_cursor, 0);
+    }
+
+    #[test]
+    fn multiline_paste_text_is_normalized_before_insertion() {
+        let mut app = AppState::new("m".into(), ".".into(), ".".into());
+        app.insert_text(
+            &"linha 1\r\nlinha 2\nlinha 3\rlinha 4"
+                .replace("\r\n", "\n")
+                .replace('\r', "\n"),
+        );
+        assert_eq!(app.input, "linha 1\nlinha 2\nlinha 3\nlinha 4");
+        assert_eq!(app.cursor, app.input.chars().count());
     }
 
     #[test]
