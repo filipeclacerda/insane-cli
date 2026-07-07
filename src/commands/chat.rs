@@ -34,6 +34,69 @@ pub fn use_tui(ctx: &AppContext) -> bool {
         && std::io::stdout().is_terminal()
 }
 
+pub(crate) fn initial_model(ctx: &AppContext) -> String {
+    ctx.cli
+        .model
+        .clone()
+        .or_else(|| std::env::var("INSANE_MODEL").ok())
+        .or_else(|| session_store::last_model(&ctx.cfg.active_provider))
+        .unwrap_or_else(|| ctx.cfg.model.clone())
+}
+
+pub(crate) fn resume_choice(provider: &str, choice: Option<usize>) -> Option<usize> {
+    let sessions = session_store::list(provider);
+    match choice {
+        Some(n @ 1..=3) if n <= sessions.len() => Some(n - 1),
+        Some(_) => None,
+        None if sessions.len() == 1 => Some(0),
+        None => None,
+    }
+}
+
+pub(crate) fn format_session_options(provider: &str) -> Vec<String> {
+    let sessions = session_store::list(provider);
+    if sessions.is_empty() {
+        return vec!["no saved session to resume for this provider".to_string()];
+    }
+    let mut lines = vec!["saved sessions:".to_string()];
+    for summary in sessions {
+        lines.push(format!(
+            "  {}. {} messages, model {} -- {}",
+            summary.index + 1,
+            summary.messages,
+            summary.model,
+            summary.preview
+        ));
+    }
+    lines.push("use /resume 1, /resume 2, or /resume 3".to_string());
+    lines
+}
+
+pub(crate) fn restore_loaded_session(
+    session: &mut Session,
+    loaded: session_store::LoadedSession,
+    tools_enabled: bool,
+    cwd: &std::path::Path,
+    ctx: &AppContext,
+) {
+    session.model = loaded.model.clone();
+    if tools_enabled {
+        session.history.clear();
+        session.push_system(agent::system_prompt(
+            cwd,
+            &session.model,
+            &ctx.cfg.ignore,
+            &ctx.cfg.system_prompt_extra,
+        ));
+    } else {
+        session.history.clear();
+    }
+    for m in loaded.messages {
+        session.history.push(m);
+    }
+    session.trim();
+}
+
 /// Runs one agentic turn, logging any error and returning the turn's
 /// `finish_reason` (SPEC-UX A3) so the caller can offer `/continue`.
 async fn run_agent_turn(
@@ -68,11 +131,7 @@ async fn run_plain(
     tools_enabled: bool,
     continue_last: bool,
 ) -> Result<(), ApiError> {
-    let model = ctx
-        .cli
-        .model
-        .clone()
-        .unwrap_or_else(|| ctx.cfg.model.clone());
+    let model = initial_model(ctx);
     let mut session = Session::new(model.clone(), ctx.cfg.max_context_bytes);
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let ui = PlainUi::new(ctx.out);
@@ -94,24 +153,7 @@ async fn run_plain(
     // Resume the most recently saved session for this provider, if asked.
     let resumed = if continue_last {
         if let Some(loaded) = session_store::load(&ctx.cfg.active_provider) {
-            session.model = loaded.model.clone();
-            // Re-push the system prompt first so the restored history sits
-            // after it (the saved history excludes the system message).
-            if tools_enabled {
-                session.history.clear();
-                session.push_system(agent::system_prompt(
-                    &cwd,
-                    &session.model,
-                    &ctx.cfg.ignore,
-                    &ctx.cfg.system_prompt_extra,
-                ));
-            } else {
-                session.history.clear();
-            }
-            for m in loaded.messages {
-                session.history.push(m);
-            }
-            session.trim();
+            restore_loaded_session(&mut session, loaded, tools_enabled, &cwd, ctx);
             output::log_info(
                 ctx.out,
                 &format!(
@@ -184,6 +226,7 @@ async fn run_plain(
                         output::log_info(ctx.out, &format!("current model: {}", session.model));
                     } else {
                         session.model = m.clone();
+                        session_store::save_model(&ctx.cfg.active_provider, &session.model);
                         if tools_enabled {
                             session.push_system(agent::system_prompt(
                                 &cwd,
@@ -249,35 +292,27 @@ async fn run_plain(
                             run_agent_turn(ctx, &mut session, &mut permissions, &cwd, &ui).await;
                     }
                 }
-                ReplCommand::Resume => {
-                    if let Some(loaded) = session_store::load(&ctx.cfg.active_provider) {
-                        session.model = loaded.model.clone();
-                        if tools_enabled {
-                            session.history.clear();
-                            session.push_system(agent::system_prompt(
-                                &cwd,
-                                &session.model,
-                                &ctx.cfg.ignore,
-                                &ctx.cfg.system_prompt_extra,
-                            ));
-                        } else {
-                            session.history.clear();
+                ReplCommand::Resume(choice) => {
+                    if let Some(index) = resume_choice(&ctx.cfg.active_provider, choice) {
+                        if let Some(loaded) =
+                            session_store::load_at(&ctx.cfg.active_provider, index)
+                        {
+                            restore_loaded_session(&mut session, loaded, tools_enabled, &cwd, ctx);
+                            last_finish_reason = None;
+                            output::log_info(
+                                ctx.out,
+                                &format!(
+                                    "resumed session ({} messages, model {})",
+                                    session.history.len(),
+                                    session.model
+                                ),
+                            );
                         }
-                        for m in loaded.messages {
-                            session.history.push(m);
-                        }
-                        session.trim();
-                        last_finish_reason = None;
-                        output::log_info(
-                            ctx.out,
-                            &format!(
-                                "resumed session ({} messages, model {})",
-                                session.history.len(),
-                                session.model
-                            ),
-                        );
                     } else {
-                        output::log_info(ctx.out, "no saved session to resume for this provider");
+                        last_finish_reason = None;
+                        for line in format_session_options(&ctx.cfg.active_provider) {
+                            output::log_info(ctx.out, &line);
+                        }
                     }
                 }
                 ReplCommand::Tools => {

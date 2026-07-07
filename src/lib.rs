@@ -30,6 +30,7 @@ pub mod tools;
 pub mod tui;
 pub mod ui;
 
+use std::io;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -39,6 +40,7 @@ use client::nim::NimClient;
 use error::ApiError;
 use limiter::RateLimiter;
 use output::OutputOptions;
+use tracing_subscriber::fmt::MakeWriter;
 
 /// Shared context threaded through every command handler.
 #[derive(Clone)]
@@ -102,11 +104,61 @@ fn init_tracing(cli: &Cli) {
 
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(std::io::stderr);
+        .with_ansi(false)
+        .with_writer(TuiAwareWriter);
     if cli.json {
         builder.json().init();
     } else {
         builder.init();
+    }
+}
+
+struct TuiAwareWriter;
+
+struct TuiAwareWrite {
+    buf: Vec<u8>,
+}
+
+impl<'a> MakeWriter<'a> for TuiAwareWriter {
+    type Writer = TuiAwareWrite;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        TuiAwareWrite { buf: Vec::new() }
+    }
+}
+
+impl TuiAwareWrite {
+    fn emit(&mut self) -> io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let text = String::from_utf8_lossy(&self.buf).to_string();
+        self.buf.clear();
+        for line in text.lines() {
+            if crate::tui::capture_log_line(crate::secrets::redact(&crate::error::redact(line))) {
+            } else {
+                use io::Write as _;
+                writeln!(io::stderr(), "{line}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl io::Write for TuiAwareWrite {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.emit()
+    }
+}
+
+impl Drop for TuiAwareWrite {
+    fn drop(&mut self) {
+        let _ = self.emit();
     }
 }
 

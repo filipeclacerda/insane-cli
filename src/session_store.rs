@@ -18,7 +18,7 @@ use crate::config;
 use crate::error::ApiError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredSession {
+struct LegacyStoredSession {
     /// Schema version, for forward-compatible migrations later.
     version: u32,
     model: String,
@@ -26,7 +26,25 @@ struct StoredSession {
     messages: Vec<ChatMessage>,
 }
 
-const STORE_VERSION: u32 = 1;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredSession {
+    model: String,
+    /// History *without* the leading system message (regenerated on load).
+    messages: Vec<ChatMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredSessions {
+    /// Schema version, for forward-compatible migrations later.
+    version: u32,
+    #[serde(default)]
+    last_model: Option<String>,
+    #[serde(default)]
+    sessions: Vec<StoredSession>,
+}
+
+const STORE_VERSION: u32 = 2;
+const MAX_SESSIONS: usize = 3;
 
 /// Directory where per-provider session files live.
 fn sessions_dir() -> PathBuf {
@@ -66,6 +84,16 @@ pub fn save(provider: &str, model: &str, history: &[ChatMessage]) {
     }
 }
 
+/// Persists just the model preference for `provider`, preserving any saved
+/// resumable history if one exists.
+pub fn save_model(provider: &str, model: &str) {
+    let mut stored = load_store(provider).unwrap_or_else(empty_store);
+    stored.last_model = Some(model.to_string());
+    if let Err(e) = write_store(provider, &stored) {
+        tracing::warn!("could not save model preference: {e}");
+    }
+}
+
 fn try_save(provider: &str, model: &str, history: &[ChatMessage]) -> std::io::Result<()> {
     // Drop the leading system message: it's regenerated on resume from
     // the live config, so persisting it would only leak stale
@@ -75,24 +103,83 @@ fn try_save(provider: &str, model: &str, history: &[ChatMessage]) -> std::io::Re
         .skip_while(|m| m.role == "system")
         .cloned()
         .collect();
-    let stored = StoredSession {
-        version: STORE_VERSION,
-        model: model.to_string(),
-        messages,
-    };
-    let dir = sessions_dir();
-    std::fs::create_dir_all(&dir)?;
-    let text = serde_json::to_string(&stored).unwrap_or_default();
-    std::fs::write(session_path(provider), text)
+    let mut stored = load_store(provider).unwrap_or_else(empty_store);
+    stored.last_model = Some(model.to_string());
+    if !messages.is_empty() {
+        let session = StoredSession {
+            model: model.to_string(),
+            messages,
+        };
+        if stored
+            .sessions
+            .first()
+            .map(|latest| is_continuation(latest, &session))
+            .unwrap_or(false)
+        {
+            stored.sessions[0] = session;
+        } else {
+            stored.sessions.insert(0, session);
+        }
+        stored.sessions.truncate(MAX_SESSIONS);
+    }
+    write_store(provider, &stored)
 }
 
 /// Loads the most recently saved session for `provider`, if any. Returns
 /// `None` when there's no saved session or it can't be parsed (the user
 /// simply starts a fresh chat in that case).
 pub fn load(provider: &str) -> Option<LoadedSession> {
+    load_at(provider, 0)
+}
+
+pub fn load_at(provider: &str, index: usize) -> Option<LoadedSession> {
+    load_store(provider)?
+        .sessions
+        .into_iter()
+        .nth(index)
+        .map(LoadedSession::from)
+}
+
+pub fn list(provider: &str) -> Vec<SessionSummary> {
+    load_store(provider)
+        .map(|stored| {
+            stored
+                .sessions
+                .into_iter()
+                .take(MAX_SESSIONS)
+                .enumerate()
+                .map(|(index, session)| SessionSummary {
+                    index,
+                    model: session.model,
+                    messages: session.messages.len(),
+                    preview: preview(&session.messages),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn load_store(provider: &str) -> Option<StoredSessions> {
     let path = session_path(provider);
     let text = std::fs::read_to_string(&path).ok()?;
-    let stored: StoredSession = serde_json::from_str(&text).ok()?;
+    parse_store(&text)
+}
+
+fn parse_store(text: &str) -> Option<StoredSessions> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let version = value.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
+    if version == 1 {
+        let legacy: LegacyStoredSession = serde_json::from_value(value).ok()?;
+        return Some(StoredSessions {
+            version: STORE_VERSION,
+            last_model: Some(legacy.model.clone()),
+            sessions: vec![StoredSession {
+                model: legacy.model,
+                messages: legacy.messages,
+            }],
+        });
+    }
+    let stored: StoredSessions = serde_json::from_value(value).ok()?;
     if stored.version != STORE_VERSION {
         tracing::warn!(
             "ignoring saved session with unsupported version {}",
@@ -100,9 +187,61 @@ pub fn load(provider: &str) -> Option<LoadedSession> {
         );
         return None;
     }
-    Some(LoadedSession {
-        model: stored.model,
-        messages: stored.messages,
+    Some(stored)
+}
+
+fn empty_store() -> StoredSessions {
+    StoredSessions {
+        version: STORE_VERSION,
+        last_model: None,
+        sessions: Vec::new(),
+    }
+}
+
+fn write_store(provider: &str, stored: &StoredSessions) -> std::io::Result<()> {
+    let dir = sessions_dir();
+    std::fs::create_dir_all(&dir)?;
+    let text = serde_json::to_string(stored).unwrap_or_default();
+    std::fs::write(session_path(provider), text)
+}
+
+fn is_continuation(old: &StoredSession, new: &StoredSession) -> bool {
+    old.model == new.model
+        && !old.messages.is_empty()
+        && old.messages.len() <= new.messages.len()
+        && old
+            .messages
+            .iter()
+            .zip(&new.messages)
+            .all(|(a, b)| serde_json::to_value(a).ok() == serde_json::to_value(b).ok())
+}
+
+fn preview(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .find(|m| m.role == "user")
+        .and_then(|m| m.content.as_deref())
+        .map(|text| {
+            let mut short: String = text.chars().take(80).collect();
+            if text.chars().count() > 80 {
+                short.push_str("...");
+            }
+            short.replace('\n', " ")
+        })
+        .unwrap_or_else(|| "(sem mensagem de usuario)".to_string())
+}
+
+/// Loads the last model used with `provider`, without restoring its chat
+/// history.
+pub fn last_model(provider: &str) -> Option<String> {
+    load_store(provider).and_then(|stored| {
+        stored.last_model.or_else(|| {
+            stored
+                .sessions
+                .into_iter()
+                .next()
+                .map(|session| session.model)
+        })
     })
 }
 
@@ -111,6 +250,24 @@ pub fn load(provider: &str) -> Option<LoadedSession> {
 pub struct LoadedSession {
     pub model: String,
     pub messages: Vec<ChatMessage>,
+}
+
+impl From<StoredSession> for LoadedSession {
+    fn from(value: StoredSession) -> Self {
+        LoadedSession {
+            model: value.model,
+            messages: value.messages,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    /// Zero-based index for [`load_at`].
+    pub index: usize,
+    pub model: String,
+    pub messages: usize,
+    pub preview: String,
 }
 
 /// Removes the saved session for `provider` (e.g. after `/clear` so a
@@ -163,6 +320,70 @@ mod tests {
     #[test]
     fn load_missing_returns_none() {
         assert!(load("__definitely_not_a_real_provider__").is_none());
+    }
+
+    #[test]
+    fn save_model_updates_preference_without_rewriting_saved_session() {
+        let provider = "__insane_test_provider_save_model__";
+        let history = vec![ChatMessage::text("user", "hello")];
+        try_save(provider, "old-model", &history).unwrap();
+
+        save_model(provider, "new-model");
+
+        let loaded = load(provider).unwrap();
+        assert_eq!(loaded.model, "old-model");
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages[0].content.as_deref(), Some("hello"));
+        assert_eq!(last_model(provider).as_deref(), Some("new-model"));
+        let _ = clear(provider);
+    }
+
+    #[test]
+    fn keeps_only_three_most_recent_distinct_sessions() {
+        let provider = "__insane_test_provider_three_sessions__";
+        let _ = clear(provider);
+
+        for idx in 1..=4 {
+            try_save(
+                provider,
+                "m",
+                &[ChatMessage::text("user", format!("session {idx}"))],
+            )
+            .unwrap();
+        }
+
+        let sessions = list(provider);
+        assert_eq!(sessions.len(), 3);
+        assert_eq!(sessions[0].preview, "session 4");
+        assert_eq!(sessions[1].preview, "session 3");
+        assert_eq!(sessions[2].preview, "session 2");
+        assert_eq!(
+            load_at(provider, 2).unwrap().messages[0].content.as_deref(),
+            Some("session 2")
+        );
+        let _ = clear(provider);
+    }
+
+    #[test]
+    fn saving_continuation_updates_latest_session_instead_of_prepending() {
+        let provider = "__insane_test_provider_continuation__";
+        let _ = clear(provider);
+
+        try_save(provider, "m", &[ChatMessage::text("user", "hello")]).unwrap();
+        try_save(
+            provider,
+            "m",
+            &[
+                ChatMessage::text("user", "hello"),
+                ChatMessage::text("assistant", "hi"),
+            ],
+        )
+        .unwrap();
+
+        let sessions = list(provider);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].messages, 2);
+        let _ = clear(provider);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::app::{AppState, MsgBlock, ToolStatus};
+use super::app::{AppState, MsgBlock, PendingSessionPicker, ToolStatus};
 use super::format::{diff_lines_for_modal, wrap_text, DiffLineKind};
 use super::theme;
 
@@ -34,6 +34,25 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         draw_header(frame, chunks[0], state);
         draw_conversation(frame, chunks[1], state);
         draw_approval_panel(frame, chunks[2], pending);
+        draw_status(frame, chunks[3], state);
+        return;
+    }
+    if let Some(picker) = &state.session_picker {
+        let max_height = area.height.saturating_sub(4).max(1);
+        let min_height = 7.min(max_height);
+        let picker_height = (picker.sessions.len() as u16 + 5).clamp(min_height, max_height);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(3),
+                Constraint::Length(picker_height),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        draw_header(frame, chunks[0], state);
+        draw_conversation(frame, chunks[1], state);
+        draw_session_picker(frame, chunks[2], picker);
         draw_status(frame, chunks[3], state);
         return;
     }
@@ -203,7 +222,7 @@ fn draw_input(frame: &mut Frame, area: Rect, state: &AppState) {
         .wrap(Wrap { trim: false });
     frame.render_widget(p, area);
 
-    if !state.processing && state.confirm.is_none() {
+    if !state.processing && state.confirm.is_none() && state.session_picker.is_none() {
         let row = cursor_row.saturating_sub(start) as u16;
         let col = (cursor_col as u16).min(area.width.saturating_sub(2));
         frame.set_cursor_position(Position::new(area.x + 1 + col, area.y + 1 + row));
@@ -379,10 +398,51 @@ fn draw_approval_panel(frame: &mut Frame, area: Rect, pending: &super::app::Pend
     frame.render_widget(p, area);
 }
 
+fn draw_session_picker(frame: &mut Frame, area: Rect, picker: &PendingSessionPicker) {
+    let width = area.width.saturating_sub(4).max(1) as usize;
+    let mut lines = vec![Line::from(Span::styled(
+        "Escolha uma sessao para retomar",
+        theme::assistant().add_modifier(Modifier::BOLD),
+    ))];
+    lines.push(Line::from(""));
+
+    for (idx, session) in picker.sessions.iter().enumerate() {
+        let selected = idx == picker.selected;
+        let marker = if selected { "›" } else { " " };
+        let text = format!(
+            " {} {}. {} mensagens · {} · {}",
+            marker,
+            idx + 1,
+            session.messages,
+            session.model,
+            session.preview
+        );
+        for wrapped in wrap_text(&text, width) {
+            lines.push(Line::from(Span::styled(
+                wrapped,
+                if selected {
+                    theme::selected()
+                } else {
+                    theme::assistant()
+                },
+            )));
+        }
+    }
+
+    let p = Paragraph::new(lines)
+        .style(theme::panel())
+        .block(theme::block(
+            " resume  ↑/↓ select  Enter resume  Esc close ",
+        ))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(p, area);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{draw, input_layout};
-    use crate::tui::app::{AppState, PendingConfirm};
+    use crate::session_store::SessionSummary;
+    use crate::tui::app::{AppState, PendingConfirm, PendingSessionPicker};
     use crate::ui::ConfirmRequest;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -428,5 +488,31 @@ mod tests {
             .collect();
         assert!(rendered.contains("approve: edit_file"));
         assert!(rendered.contains("Allow once"));
+    }
+
+    #[test]
+    fn session_picker_is_rendered_in_bottom_layout() {
+        let mut state = AppState::new("model".into(), ".".into(), ".".into());
+        state.session_picker = Some(PendingSessionPicker {
+            sessions: vec![SessionSummary {
+                index: 0,
+                model: "model-a".into(),
+                messages: 3,
+                preview: "primeira pergunta".into(),
+            }],
+            selected: 0,
+        });
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("resume"));
+        assert!(rendered.contains("primeira pergunta"));
     }
 }

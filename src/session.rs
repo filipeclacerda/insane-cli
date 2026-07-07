@@ -26,7 +26,9 @@ pub fn parse_command(line: &str) -> Option<Command> {
     } else if trimmed == "/continue" {
         Some(Command::Continue)
     } else if trimmed == "/resume" {
-        Some(Command::Resume)
+        Some(Command::Resume(None))
+    } else if let Some(rest) = trimmed.strip_prefix("/resume ") {
+        Some(Command::Resume(rest.trim().parse::<usize>().ok()))
     } else if trimmed == "/help" {
         Some(Command::Help)
     } else if trimmed == "/models" {
@@ -70,7 +72,7 @@ pub enum Command {
     /// Reloads the most recently saved session for the active provider,
     /// replacing the current conversation. Used to recover a chat that was
     /// closed in a previous `insane` invocation.
-    Resume,
+    Resume(Option<usize>),
     /// Lists available commands and (in the TUI) keybindings (SPEC-UX B4).
     Help,
 }
@@ -78,7 +80,7 @@ pub enum Command {
 /// Text for `/help`: slash commands, shared by line mode and the TUI. The
 /// TUI appends its own keybinding list after this (SPEC-UX B4).
 pub const HELP_COMMANDS: &str =
-    "commands: /provider <name> /providers /model <name> /models /mode <default|accept-edits|auto> /clear /tools /cwd /continue /resume /help /exit";
+    "commands: /provider <name> /providers /model <name> /models /mode <default|accept-edits|auto> /clear /tools /cwd /continue /resume [1-3] /help /exit";
 
 /// Metadata used by `/help` and the TUI's live slash-command palette.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,8 +138,8 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/resume",
-        usage: "/resume",
-        description: "retomar a última sessão salva",
+        usage: "/resume [1-3]",
+        description: "listar/retomar sessões salvas",
     },
     SlashCommand {
         name: "/help",
@@ -360,7 +362,14 @@ mod tests {
             parse_command("/continue"),
             Some(Command::Continue)
         ));
-        assert!(matches!(parse_command("/resume"), Some(Command::Resume)));
+        assert!(matches!(
+            parse_command("/resume"),
+            Some(Command::Resume(None))
+        ));
+        assert!(matches!(
+            parse_command("/resume 2"),
+            Some(Command::Resume(Some(2)))
+        ));
         assert!(matches!(parse_command("/help"), Some(Command::Help)));
         assert!(matches!(parse_command("/models"), Some(Command::Models)));
         assert!(matches!(

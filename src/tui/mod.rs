@@ -25,7 +25,7 @@ pub mod view;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crossterm::event::{
@@ -50,10 +50,45 @@ use crate::tools::{
 use crate::ui::Decision;
 use crate::AppContext;
 
-use app::{AppState, InteractionMode};
+use app::{AppState, InteractionMode, PendingSessionPicker};
 use ui_impl::TuiUi;
 
 type Term = Terminal<CrosstermBackend<io::Stdout>>;
+
+static LOG_SINK: OnceLock<Mutex<Option<Arc<Mutex<AppState>>>>> = OnceLock::new();
+
+fn log_sink() -> &'static Mutex<Option<Arc<Mutex<AppState>>>> {
+    LOG_SINK.get_or_init(|| Mutex::new(None))
+}
+
+struct TuiLogSinkGuard;
+
+impl TuiLogSinkGuard {
+    fn install(state: Arc<Mutex<AppState>>) -> Self {
+        *log_sink().lock().unwrap() = Some(state);
+        TuiLogSinkGuard
+    }
+}
+
+impl Drop for TuiLogSinkGuard {
+    fn drop(&mut self) {
+        *log_sink().lock().unwrap() = None;
+    }
+}
+
+pub(crate) fn capture_log_line(line: String) -> bool {
+    let Some(state) = log_sink().lock().unwrap().clone() else {
+        return false;
+    };
+    let line = line.trim();
+    if line.is_empty() {
+        return true;
+    }
+    if let Ok(mut st) = state.try_lock() {
+        st.push_warn(line.to_string());
+    }
+    true
+}
 
 /// Restores the terminal on drop -- covers every normal/error exit path
 /// from `run` (SPEC-UX B5). Does *not* cover panics: this crate builds with
@@ -129,11 +164,7 @@ async fn run_app(
     continue_last: bool,
     terminal: &mut Term,
 ) -> Result<(), ApiError> {
-    let model = ctx
-        .cli
-        .model
-        .clone()
-        .unwrap_or_else(|| ctx.cfg.model.clone());
+    let model = crate::commands::chat::initial_model(ctx);
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let cwd_display = cwd.display().to_string();
 
@@ -144,19 +175,19 @@ async fn run_app(
 
     // Resume the most recently saved session for this provider, if asked.
     let mut did_resume = false;
+    let mut open_resume_picker = false;
     if continue_last {
-        if let Some(loaded) = crate::session_store::load(&ctx.cfg.active_provider) {
-            session.model = loaded.model.clone();
-            if tools_enabled {
-                session.history.clear();
-                sync_agent_prompt(ctx, &mut session, &cwd, InteractionMode::Default);
-            } else {
-                session.history.clear();
-            }
-            for m in loaded.messages {
-                session.history.push(m);
-            }
-            session.trim();
+        let saved = crate::session_store::list(&ctx.cfg.active_provider);
+        if saved.len() > 1 {
+            open_resume_picker = true;
+        } else if let Some(loaded) = crate::session_store::load(&ctx.cfg.active_provider) {
+            crate::commands::chat::restore_loaded_session(
+                &mut session,
+                loaded,
+                tools_enabled,
+                &cwd,
+                ctx,
+            );
             did_resume = true;
         }
     }
@@ -169,7 +200,11 @@ async fn run_app(
     {
         let mut st = state.lock().unwrap();
         st.ignore = ctx.cfg.ignore.clone();
+        if open_resume_picker {
+            open_session_picker(&mut st, &ctx.cfg.active_provider);
+        }
     }
+    let _log_sink = TuiLogSinkGuard::install(state.clone());
     let ui = TuiUi::new(state.clone());
     let mut permissions = Permissions::with_ui(Box::new(TuiUi::new(state.clone())));
     let mut last_finish_reason: Option<String> = None;
@@ -217,7 +252,7 @@ async fn run_app(
                         .to_string(),
                 );
             }
-        } else if continue_last {
+        } else if continue_last && !open_resume_picker {
             st.push_warn(
                 "no saved session to resume for this provider; starting a fresh chat".to_string(),
             );
@@ -277,6 +312,7 @@ async fn run_app(
                             &mut permissions,
                             &cwd,
                             tools_enabled,
+                            &mut last_finish_reason,
                         );
                     }
                     Some(Err(_)) | None => {
@@ -732,6 +768,7 @@ fn handle_event(
     permissions: &mut Permissions,
     cwd: &std::path::Path,
     tools_enabled: bool,
+    last_finish_reason: &mut Option<String>,
 ) -> bool {
     match event {
         Event::Resize(_, _) => {
@@ -746,6 +783,8 @@ fn handle_event(
                 MouseEventKind::ScrollUp => {
                     if let Some(pending) = st.confirm.as_mut() {
                         pending.scroll = pending.scroll.saturating_sub(2);
+                    } else if let Some(picker) = st.session_picker.as_mut() {
+                        picker.selected = picker.selected.saturating_sub(1);
                     } else {
                         st.scroll = st.scroll.saturating_add(2);
                     }
@@ -754,6 +793,9 @@ fn handle_event(
                 MouseEventKind::ScrollDown => {
                     if let Some(pending) = st.confirm.as_mut() {
                         pending.scroll = pending.scroll.saturating_add(2);
+                    } else if let Some(picker) = st.session_picker.as_mut() {
+                        picker.selected =
+                            (picker.selected + 1).min(picker.sessions.len().saturating_sub(1));
                     } else {
                         st.scroll = st.scroll.saturating_sub(2);
                     }
@@ -763,7 +805,16 @@ fn handle_event(
             }
             false
         }
-        Event::Key(key) => handle_key(key, ctx, state, session, permissions, cwd, tools_enabled),
+        Event::Key(key) => handle_key(
+            key,
+            ctx,
+            state,
+            session,
+            permissions,
+            cwd,
+            tools_enabled,
+            last_finish_reason,
+        ),
         Event::Paste(text) => {
             let mut st = state.lock().unwrap();
             restore_pending_submit_as_input(&mut st);
@@ -786,6 +837,96 @@ fn restore_pending_submit_as_input(st: &mut AppState) {
     st.insert_newline();
 }
 
+enum SessionPickerKey {
+    NoPicker,
+    Consumed,
+    Chosen(usize),
+}
+
+fn open_session_picker(st: &mut AppState, provider: &str) {
+    let sessions = crate::session_store::list(provider);
+    if sessions.is_empty() {
+        st.push_warn("no saved session to resume for this provider".to_string());
+    } else {
+        st.session_picker = Some(PendingSessionPicker {
+            sessions,
+            selected: 0,
+        });
+        st.dirty = true;
+    }
+}
+
+fn handle_session_picker_key(key: &KeyEvent, state: &Arc<Mutex<AppState>>) -> SessionPickerKey {
+    let mut st = state.lock().unwrap();
+    let Some(picker) = st.session_picker.as_mut() else {
+        return SessionPickerKey::NoPicker;
+    };
+    match key.code {
+        KeyCode::Up => {
+            picker.selected = picker.selected.saturating_sub(1);
+            st.dirty = true;
+            SessionPickerKey::Consumed
+        }
+        KeyCode::Down => {
+            picker.selected = (picker.selected + 1).min(picker.sessions.len().saturating_sub(1));
+            st.dirty = true;
+            SessionPickerKey::Consumed
+        }
+        KeyCode::Esc => {
+            st.session_picker = None;
+            st.dirty = true;
+            SessionPickerKey::Consumed
+        }
+        KeyCode::Enter => {
+            let selected = picker.selected_index();
+            st.session_picker = None;
+            st.dirty = true;
+            selected
+                .map(SessionPickerKey::Chosen)
+                .unwrap_or(SessionPickerKey::Consumed)
+        }
+        _ => SessionPickerKey::Consumed,
+    }
+}
+
+fn restore_loaded_session_for_tui(
+    state: &Arc<Mutex<AppState>>,
+    session: &mut Session,
+    loaded: crate::session_store::LoadedSession,
+    tools_enabled: bool,
+    cwd: &std::path::Path,
+    ctx: &AppContext,
+) {
+    crate::commands::chat::restore_loaded_session(session, loaded, tools_enabled, cwd, ctx);
+    if tools_enabled {
+        sync_agent_prompt(ctx, session, cwd, state.lock().unwrap().mode);
+    }
+    let mut st = state.lock().unwrap();
+    st.model = session.model.clone();
+    st.clear_conversation();
+    st.push_warn(format!(
+        "resumed session ({} messages, model {})",
+        session.history.len(),
+        session.model
+    ));
+    for m in &session.history {
+        match m.role.as_str() {
+            "user" => {
+                if let Some(c) = m.content.as_deref() {
+                    st.messages.push(app::MsgBlock::User(c.to_string()));
+                }
+            }
+            "assistant" => {
+                if let Some(c) = m.content.as_deref() {
+                    st.messages.push(app::MsgBlock::Assistant(c.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+    st.dirty = true;
+}
+
 /// Returns `true` when a line was just submitted and a turn should now be
 /// started by the caller.
 #[allow(clippy::too_many_arguments)]
@@ -797,9 +938,22 @@ fn handle_key(
     permissions: &mut Permissions,
     cwd: &std::path::Path,
     tools_enabled: bool,
+    last_finish_reason: &mut Option<String>,
 ) -> bool {
     if key.kind == crossterm::event::KeyEventKind::Release {
         return false;
+    }
+
+    match handle_session_picker_key(&key, state) {
+        SessionPickerKey::NoPicker => {}
+        SessionPickerKey::Consumed => return false,
+        SessionPickerKey::Chosen(index) => {
+            if let Some(loaded) = crate::session_store::load_at(&ctx.cfg.active_provider, index) {
+                restore_loaded_session_for_tui(state, session, loaded, tools_enabled, cwd, ctx);
+                *last_finish_reason = None;
+            }
+            return false;
+        }
     }
 
     // A confirmation modal, if open, captures all keys.
@@ -1078,6 +1232,7 @@ fn submit_line(
                     st.push_warn(format!("current model: {}", session.model));
                 } else {
                     session.model = m.clone();
+                    crate::session_store::save_model(&ctx.cfg.active_provider, &session.model);
                     st.model = m.clone();
                     st.push_warn(format!("model set to {m}"));
                     let mode = st.mode;
@@ -1142,15 +1297,16 @@ fn submit_line(
                     }
                 };
                 *ctx = next;
-                *session = Session::new(ctx.cfg.model.clone(), ctx.cfg.max_context_bytes);
+                let model = crate::commands::chat::initial_model(ctx);
+                *session = Session::new(model.clone(), ctx.cfg.max_context_bytes);
                 if tools_enabled {
                     sync_agent_prompt(ctx, session, cwd, state.lock().unwrap().mode);
                 }
                 let mut st = state.lock().unwrap();
                 st.clear_conversation();
                 st.provider = ctx.cfg.active_provider.clone();
-                st.model = ctx.cfg.model.clone();
-                st.set_models(vec![ctx.cfg.model.clone()]);
+                st.model = model.clone();
+                st.set_models(vec![model]);
                 st.push_warn(format!(
                     "switched to provider '{}' and started a new chat",
                     ctx.cfg.active_provider
@@ -1245,50 +1401,27 @@ Shift+Tab=cycle mode  PgUp/PgDn=scroll  Ctrl+End=bottom  Ctrl+C=cancel/exit  Ctr
                     return true;
                 }
             }
-            ReplCommand::Resume => {
-                if let Some(loaded) = crate::session_store::load(&ctx.cfg.active_provider) {
-                    session.model = loaded.model.clone();
-                    if tools_enabled {
-                        session.history.clear();
-                        sync_agent_prompt(ctx, session, cwd, state.lock().unwrap().mode);
-                    } else {
-                        session.history.clear();
-                    }
-                    let mut st = state.lock().unwrap();
-                    st.model = session.model.clone();
-                    st.clear_conversation();
-                    st.push_warn(format!(
-                        "resumed session ({} messages, model {})",
-                        loaded.messages.len(),
-                        session.model
-                    ));
-                    for m in &loaded.messages {
-                        match m.role.as_str() {
-                            "user" => {
-                                if let Some(c) = m.content.as_deref() {
-                                    st.messages.push(app::MsgBlock::User(c.to_string()));
-                                }
-                            }
-                            "assistant" => {
-                                if let Some(c) = m.content.as_deref() {
-                                    st.messages.push(app::MsgBlock::Assistant(c.to_string()));
-                                }
-                            }
-                            _ => {}
+            ReplCommand::Resume(choice) => {
+                if let Some(n) = choice {
+                    let index = n.saturating_sub(1);
+                    if n > 0 {
+                        if let Some(loaded) =
+                            crate::session_store::load_at(&ctx.cfg.active_provider, index)
+                        {
+                            restore_loaded_session_for_tui(
+                                state,
+                                session,
+                                loaded,
+                                tools_enabled,
+                                cwd,
+                                ctx,
+                            );
+                            *last_finish_reason = None;
+                            return false;
                         }
                     }
-                    for m in loaded.messages {
-                        session.history.push(m);
-                    }
-                    session.trim();
-                    *last_finish_reason = None;
-                    st.dirty = true;
-                } else {
-                    state
-                        .lock()
-                        .unwrap()
-                        .push_warn("no saved session to resume for this provider".to_string());
                 }
+                open_session_picker(&mut state.lock().unwrap(), &ctx.cfg.active_provider);
                 return false;
             }
         }

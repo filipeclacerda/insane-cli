@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use crate::client::Usage;
 use crate::context;
 use crate::session::SLASH_COMMANDS;
+use crate::session_store::SessionSummary;
 use crate::ui::ConfirmRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +105,21 @@ impl PendingConfirm {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingSessionPicker {
+    pub sessions: Vec<SessionSummary>,
+    /// Highlighted saved session in the bottom picker.
+    pub selected: usize,
+}
+
+impl PendingSessionPicker {
+    pub fn selected_index(&self) -> Option<usize> {
+        self.sessions
+            .get(self.selected)
+            .map(|session| session.index)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StatusInfo {
     pub rate_used: Option<u32>,
@@ -145,6 +161,7 @@ pub struct AppState {
     pub processing: bool,
     pub status: StatusInfo,
     pub confirm: Option<PendingConfirm>,
+    pub session_picker: Option<PendingSessionPicker>,
     /// Set whenever render state changes; the main loop clears it after a
     /// redraw (SPEC-UX B3: throttled ~30fps rendering).
     pub dirty: bool,
@@ -173,6 +190,7 @@ impl AppState {
             processing: false,
             status: StatusInfo::default(),
             confirm: None,
+            session_picker: None,
             dirty: true,
             should_quit: false,
         }
