@@ -7,7 +7,7 @@ use std::time::Duration;
 use rand::Rng;
 
 use super::sse::parse_sse;
-use super::{ChatRequest, ChatResponse, ChatStream, LlmClient, ModelInfo};
+use super::{ChatRequest, ChatResponse, ChatStream, LlmClient, ModelInfo, StreamOptions};
 use crate::error::ApiError;
 use crate::limiter::RateLimiter;
 
@@ -199,6 +199,7 @@ impl LlmClient for NimClient {
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, ApiError> {
         let mut req = req;
         req.stream = false;
+        req.stream_options = None;
         let url = self.url("chat/completions");
         let resp = self
             .send_with_retry(|| self.auth(self.http.post(&url)).json(&req).send())
@@ -211,6 +212,8 @@ impl LlmClient for NimClient {
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChatStream, ApiError> {
         let mut req = req;
         req.stream = true;
+        req.stream_options
+            .get_or_insert_with(StreamOptions::include_usage);
         let url = self.url("chat/completions");
         let resp = self
             .send_with_retry(|| self.auth(self.http.post(&url)).json(&req).send())

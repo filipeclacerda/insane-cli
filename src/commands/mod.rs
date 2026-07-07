@@ -37,6 +37,7 @@ pub async fn run_chat(
         top_p: None,
         max_tokens: Some(ctx.cfg.max_tokens),
         stream: ctx.cfg.stream,
+        stream_options: None,
         tools: None,
         tool_choice: None,
     };
@@ -132,6 +133,7 @@ pub async fn fetch_full_response(
         top_p: None,
         max_tokens: Some(ctx.cfg.max_tokens),
         stream: false,
+        stream_options: None,
         tools: None,
         tool_choice: None,
     };

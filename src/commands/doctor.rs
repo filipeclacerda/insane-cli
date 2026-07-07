@@ -46,6 +46,7 @@ pub async fn run(ctx: &AppContext, deep: bool) -> Result<(), ApiError> {
             top_p: None,
             max_tokens: Some(8),
             stream: true,
+            stream_options: None,
             tools: Some(crate::tools::all_tool_defs().into_iter().take(1).collect()),
             tool_choice: Some("auto".to_string()),
         };

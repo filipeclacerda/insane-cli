@@ -118,9 +118,24 @@ pub struct ChatRequest {
     pub max_tokens: Option<u32>,
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolDef>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamOptions {
+    pub include_usage: bool,
+}
+
+impl StreamOptions {
+    pub fn include_usage() -> Self {
+        Self {
+            include_usage: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -225,4 +240,39 @@ pub trait LlmClient: Send + Sync {
     fn list_models(
         &self,
     ) -> impl std::future::Future<Output = Result<Vec<ModelInfo>, ApiError>> + Send;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_request(stream_options: Option<StreamOptions>) -> ChatRequest {
+        ChatRequest {
+            model: "model-a".to_string(),
+            messages: vec![ChatMessage::text("user", "hello")],
+            temperature: Some(0.2),
+            top_p: None,
+            max_tokens: Some(64),
+            stream: stream_options.is_some(),
+            stream_options,
+            tools: None,
+            tool_choice: None,
+        }
+    }
+
+    #[test]
+    fn stream_options_serializes_include_usage_when_requested() {
+        let req = sample_request(Some(StreamOptions::include_usage()));
+        let value = serde_json::to_value(req).unwrap();
+
+        assert_eq!(value["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn stream_options_is_omitted_when_absent() {
+        let req = sample_request(None);
+        let value = serde_json::to_value(req).unwrap();
+
+        assert!(value.get("stream_options").is_none());
+    }
 }

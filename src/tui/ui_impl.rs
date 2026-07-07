@@ -93,9 +93,15 @@ impl AgentUi for TuiUi {
         usage: Option<&Usage>,
         elapsed: Duration,
     ) {
-        let line = crate::agent::turn_summary_line(rounds, tools_executed, usage, elapsed);
         let mut st = self.state.lock().unwrap();
-        st.set_usage(usage);
+        let total = st.set_usage(usage);
+        let line = crate::agent::turn_summary_line_with_total(
+            rounds,
+            tools_executed,
+            usage,
+            elapsed,
+            total,
+        );
         st.push_turn_summary(line);
     }
 }

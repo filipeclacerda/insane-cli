@@ -9,13 +9,13 @@
 //! non-TTY stdin/stdout keep this line-mode path -- the one pipes/CI/tests
 //! always get.
 
-use std::io::IsTerminal;
+use std::{io::IsTerminal, time::Instant};
 
 use futures_util::StreamExt;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::agent;
-use crate::client::{ChatRequest, LlmClient};
+use crate::client::{ChatRequest, LlmClient, Usage};
 use crate::error::ApiError;
 use crate::output;
 use crate::session::{self, Command as ReplCommand, Session, CONTINUE_MESSAGE};
@@ -140,6 +140,7 @@ async fn run_plain(
     // `finish_reason` (e.g. `length`), so `/continue` has something to do
     // (SPEC-UX A3).
     let mut last_finish_reason: Option<String> = None;
+    let mut conversation_tokens_total: u64 = 0;
 
     if tools_enabled {
         session.push_system(agent::system_prompt(
@@ -216,6 +217,8 @@ async fn run_plain(
                 ReplCommand::Exit => break,
                 ReplCommand::Clear => {
                     session.clear();
+                    ui.reset_token_total();
+                    conversation_tokens_total = 0;
                     // Also drop the saved session so a later `--continue`
                     // doesn't resurrect a conversation the user wiped.
                     let _ = session_store::clear(&ctx.cfg.active_provider);
@@ -298,6 +301,8 @@ async fn run_plain(
                             session_store::load_at(&ctx.cfg.active_provider, index)
                         {
                             restore_loaded_session(&mut session, loaded, tools_enabled, &cwd, ctx);
+                            ui.reset_token_total();
+                            conversation_tokens_total = 0;
                             last_finish_reason = None;
                             output::log_info(
                                 ctx.out,
@@ -356,6 +361,7 @@ async fn run_plain(
             continue;
         }
 
+        let turn_start = Instant::now();
         let req = ChatRequest {
             model: session.model.clone(),
             messages: session.history.clone(),
@@ -363,17 +369,22 @@ async fn run_plain(
             top_p: None,
             max_tokens: Some(ctx.cfg.max_tokens),
             stream: true,
+            stream_options: None,
             tools: None,
             tool_choice: None,
         };
 
         let mut stream = ctx.client.chat_stream(req).await?;
         let mut full = String::new();
+        let mut turn_usage: Option<Usage> = None;
         while let Some(item) = stream.next().await {
             match item {
                 Ok(chunk) => {
                     output::print_stream_chunk(ctx.out, &chunk.delta);
                     full.push_str(&chunk.delta);
+                    if let Some(usage) = chunk.usage {
+                        turn_usage = Some(usage);
+                    }
                 }
                 Err(e) => {
                     output::log_error(&e.to_string());
@@ -384,6 +395,22 @@ async fn run_plain(
         println!();
         if !full.is_empty() {
             session.push_assistant(full);
+        }
+        if let Some(usage) = &turn_usage {
+            conversation_tokens_total =
+                conversation_tokens_total.saturating_add(usage.total_tokens as u64);
+            if !ctx.out.quiet && std::io::stderr().is_terminal() {
+                eprintln!(
+                    "{}",
+                    crate::agent::turn_summary_line_with_total(
+                        1,
+                        0,
+                        Some(usage),
+                        turn_start.elapsed(),
+                        conversation_tokens_total
+                    )
+                );
+            }
         }
     }
 

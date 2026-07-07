@@ -46,7 +46,7 @@ pub struct TurnOutcome {
     pub rounds: u32,
     /// How many tool calls were executed this turn.
     pub tools_executed: u32,
-    /// Usage from the last round that reported it, if any.
+    /// Usage accumulated across model rounds that reported it, if any.
     pub usage: Option<Usage>,
 }
 
@@ -271,18 +271,51 @@ pub(crate) fn turn_summary_line(
     let mut parts = vec![format!("{tools_executed} {tool_word}")];
     if let Some(u) = usage {
         if u.total_tokens > 0 {
-            parts.push(format!("{} tokens", format_token_count(u.total_tokens)));
+            parts.push(format!(
+                "{} tokens",
+                format_token_count(u.total_tokens as u64)
+            ));
         }
     }
     parts.push(format_duration(elapsed));
     format!("-- {}", parts.join(" | "))
 }
 
-pub(crate) fn format_token_count(n: u32) -> String {
+pub(crate) fn turn_summary_line_with_total(
+    rounds: u32,
+    tools_executed: u32,
+    usage: Option<&Usage>,
+    elapsed: Duration,
+    conversation_total_tokens: u64,
+) -> String {
+    let mut line = turn_summary_line(rounds, tools_executed, usage, elapsed);
+    if conversation_total_tokens > 0 {
+        line.push_str(&format!(
+            " | total {} tokens",
+            format_token_count(conversation_total_tokens)
+        ));
+    }
+    line
+}
+
+pub(crate) fn format_token_count(n: u64) -> String {
     if n >= 1000 {
         format!("{:.1}k", n as f64 / 1000.0)
     } else {
         n.to_string()
+    }
+}
+
+fn add_usage(acc: &mut Option<Usage>, usage: Usage) {
+    match acc {
+        Some(total) => {
+            total.prompt_tokens = total.prompt_tokens.saturating_add(usage.prompt_tokens);
+            total.completion_tokens = total
+                .completion_tokens
+                .saturating_add(usage.completion_tokens);
+            total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
+        }
+        None => *acc = Some(usage),
     }
 }
 
@@ -356,7 +389,7 @@ pub async fn run_turn(
     let known_tools: Vec<&str> = tool_defs.iter().map(|d| d.function.name.as_str()).collect();
     let turn_start = Instant::now();
     let mut tools_executed: u32 = 0;
-    let mut last_usage: Option<Usage> = None;
+    let mut turn_usage: Option<Usage> = None;
     let mut text_call_counter: usize = 0;
 
     let mut rounds = 0u32;
@@ -373,6 +406,7 @@ pub async fn run_turn(
             top_p: None,
             max_tokens: Some(ctx.cfg.max_tokens),
             stream: true,
+            stream_options: None,
             tools: Some(tool_defs.clone()),
             tool_choice: Some("auto".to_string()),
         };
@@ -387,14 +421,14 @@ pub async fn run_turn(
                 last_text: String::new(),
                 rounds,
                 tools_executed,
-                usage: last_usage,
+                usage: turn_usage,
             });
         };
         rounds += 1;
 
         let (mut text, mut tool_calls, finish_reason, usage) = round_result?;
-        if usage.is_some() {
-            last_usage = usage;
+        if let Some(usage) = usage {
+            add_usage(&mut turn_usage, usage);
         }
         ui.end_of_stream();
 
@@ -438,7 +472,7 @@ resume"
             ui.turn_summary(
                 rounds,
                 tools_executed,
-                last_usage.as_ref(),
+                turn_usage.as_ref(),
                 turn_start.elapsed(),
             );
             return Ok(TurnOutcome {
@@ -446,7 +480,7 @@ resume"
                 last_text: text,
                 rounds,
                 tools_executed,
-                usage: last_usage,
+                usage: turn_usage,
             });
         }
 
@@ -758,6 +792,17 @@ mod tests {
         };
         let line = turn_summary_line(3, 2, Some(&usage), Duration::from_secs(14));
         assert_eq!(line, "-- 2 tools | 1.9k tokens | 14s");
+    }
+
+    #[test]
+    fn turn_summary_line_with_total_includes_conversation_total() {
+        let usage = Usage {
+            prompt_tokens: 100,
+            completion_tokens: 1800,
+            total_tokens: 1900,
+        };
+        let line = turn_summary_line_with_total(3, 2, Some(&usage), Duration::from_secs(14), 5200);
+        assert_eq!(line, "-- 2 tools | 1.9k tokens | 14s | total 5.2k tokens");
     }
 
     #[test]

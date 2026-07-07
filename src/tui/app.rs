@@ -127,6 +127,7 @@ pub struct StatusInfo {
     pub min_interval_ms: u64,
     pub next_request_ms: u64,
     pub tokens_this_turn: Option<u32>,
+    pub tokens_total: u64,
     pub spinner_line: Option<String>,
 }
 
@@ -594,12 +595,23 @@ impl AppState {
     pub fn clear_conversation(&mut self) {
         self.messages.clear();
         self.scroll = 0;
+        self.status.tokens_this_turn = None;
+        self.status.tokens_total = 0;
         self.dirty = true;
     }
 
-    pub fn set_usage(&mut self, usage: Option<&Usage>) {
-        self.status.tokens_this_turn = usage.map(|u| u.total_tokens);
+    pub fn set_usage(&mut self, usage: Option<&Usage>) -> u64 {
+        if let Some(usage) = usage {
+            self.status.tokens_this_turn = Some(usage.total_tokens);
+            self.status.tokens_total = self
+                .status
+                .tokens_total
+                .saturating_add(usage.total_tokens as u64);
+        } else {
+            self.status.tokens_this_turn = None;
+        }
         self.dirty = true;
+        self.status.tokens_total
     }
 }
 

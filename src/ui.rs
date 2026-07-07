@@ -15,6 +15,7 @@
 //! concurrent render loop to starve (identical to today's behavior).
 
 use std::io::{IsTerminal, Write as _};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::client::Usage;
@@ -136,15 +137,34 @@ pub fn print_diff_colored(diff: &str) {
 /// exactly what the agentic loop did before the TUI existed.
 pub struct PlainUi {
     pub out: OutputOptions,
+    total_tokens: AtomicU64,
 }
 
 impl PlainUi {
     pub fn new(out: OutputOptions) -> Self {
-        PlainUi { out }
+        PlainUi {
+            out,
+            total_tokens: AtomicU64::new(0),
+        }
     }
 
     fn feedback_enabled(&self) -> bool {
         !self.out.quiet && std::io::stderr().is_terminal()
+    }
+
+    pub fn reset_token_total(&self) {
+        self.total_tokens.store(0, Ordering::Relaxed);
+    }
+
+    fn add_usage(&self, usage: Option<&Usage>) -> u64 {
+        match usage {
+            Some(usage) if usage.total_tokens > 0 => {
+                self.total_tokens
+                    .fetch_add(usage.total_tokens as u64, Ordering::Relaxed)
+                    + usage.total_tokens as u64
+            }
+            _ => self.total_tokens.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -230,12 +250,19 @@ impl AgentUi for PlainUi {
         usage: Option<&Usage>,
         elapsed: Duration,
     ) {
+        let total = self.add_usage(usage);
         if !self.feedback_enabled() {
             return;
         }
         eprintln!(
             "{}",
-            crate::agent::turn_summary_line(rounds, tools_executed, usage, elapsed)
+            crate::agent::turn_summary_line_with_total(
+                rounds,
+                tools_executed,
+                usage,
+                elapsed,
+                total
+            )
         );
     }
 }

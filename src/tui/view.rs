@@ -301,11 +301,19 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
             format!("next {}ms", state.status.next_request_ms),
         );
     }
-    let command_hint = if let Some(tok) = state.status.tokens_this_turn {
-        format!("tok {tok}  Shift+Tab mode  Ctrl+C cancel/exit  /help")
-    } else {
-        "tok --  Shift+Tab mode  Ctrl+C cancel/exit  /help".to_string()
+    let token_text = match (state.status.tokens_this_turn, state.status.tokens_total) {
+        (Some(tok), total) if total > 0 => format!(
+            "tok {} / total {}",
+            crate::agent::format_token_count(tok as u64),
+            crate::agent::format_token_count(total)
+        ),
+        (Some(tok), _) => format!("tok {}", crate::agent::format_token_count(tok as u64)),
+        (None, total) if total > 0 => {
+            format!("tok -- / total {}", crate::agent::format_token_count(total))
+        }
+        (None, _) => "tok --".to_string(),
     };
+    let command_hint = format!("{token_text}  Shift+Tab mode  Ctrl+C cancel/exit  /help");
     push_status_part(&mut spans, command_hint);
     let p = Paragraph::new(Line::from(spans)).style(theme::muted());
     frame.render_widget(p, area);
