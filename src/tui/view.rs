@@ -1,143 +1,129 @@
-//! ratatui rendering (SPEC-UX B2/B3): header, scrollable conversation,
-//! multi-line input, status bar, and a centered confirmation modal.
+//! Inline ratatui rendering: finalized transcript blocks are inserted into
+//! native scrollback by `mod.rs`, while this module draws only the live tail,
+//! spinner, composer, status, and small pickers in the inline viewport.
 
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::{BorderType, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::app::{AppState, MsgBlock, PendingSessionPicker, ToolStatus};
-use super::format::{diff_lines_for_modal, wrap_text, DiffLineKind};
+use super::app::{AppState, MsgBlock, PendingConfirm, PendingSessionPicker, ToolStatus};
+use super::format::{diff_lines_for_modal, truncate_summary, wrap_text, DiffLineKind};
 use super::theme;
 
-/// Input box height in lines, growing with content up to this cap
-/// (SPEC-UX B2).
 const MAX_INPUT_LINES: u16 = 5;
+const MIN_INLINE_HEIGHT: u16 = 6;
+const MAX_INLINE_HEIGHT: u16 = 15;
+pub(crate) const LIVE_TAIL_BUDGET: usize = 8;
 
 pub fn draw(frame: &mut Frame, state: &AppState) {
+    draw_inline(frame, state);
+}
+
+pub fn draw_inline(frame: &mut Frame, state: &AppState) {
     let area = frame.area();
-    frame.render_widget(ratatui::widgets::Clear, area);
-    if let Some(pending) = &state.confirm {
-        let max_height = area.height.saturating_sub(4).max(1);
-        let min_height = 8.min(max_height);
-        let approval_height = (area.height.saturating_mul(45) / 100).clamp(min_height, max_height);
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Min(3),
-                Constraint::Length(approval_height),
-                Constraint::Length(1),
-            ])
-            .split(area);
-        draw_header(frame, chunks[0], state);
-        draw_conversation(frame, chunks[1], state);
-        draw_approval_panel(frame, chunks[2], pending);
-        draw_status(frame, chunks[3], state);
-        return;
-    }
-    if let Some(picker) = &state.session_picker {
-        let max_height = area.height.saturating_sub(4).max(1);
-        let min_height = 7.min(max_height);
-        let picker_height = (picker.sessions.len() as u16 + 5).clamp(min_height, max_height);
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Min(3),
-                Constraint::Length(picker_height),
-                Constraint::Length(1),
-            ])
-            .split(area);
-        draw_header(frame, chunks[0], state);
-        draw_conversation(frame, chunks[1], state);
-        draw_session_picker(frame, chunks[2], picker);
-        draw_status(frame, chunks[3], state);
-        return;
-    }
-    let input_width = area.width.saturating_sub(2).max(1) as usize;
+    frame.render_widget(Clear, area);
+
+    let width = area.width.max(1) as usize;
+    let input_width = area.width.saturating_sub(4).max(1) as usize;
     let (visual_input, _) = input_layout(&state.input, state.cursor, input_width);
     let input_lines = visual_input.len().max(1).min(MAX_INPUT_LINES as usize) as u16;
     let suggestions = state.suggestions();
     let suggestion_height = if suggestions.is_empty() {
         0
     } else {
-        suggestions.len().min(6) as u16 + 2
+        suggestions.len().min(4) as u16 + 1
     };
+    let picker_height = if let Some(confirm) = &state.confirm {
+        confirm.option_count() as u16 + 1
+    } else if let Some(picker) = &state.session_picker {
+        picker.sessions.len().min(3) as u16 + 2
+    } else {
+        0
+    };
+    let spinner_height = if state.processing || state.status.spinner_line.is_some() {
+        1
+    } else {
+        0
+    };
+    let fixed_height = spinner_height + suggestion_height + picker_height + input_lines + 3;
+    let tail_height = area.height.saturating_sub(fixed_height);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),                 // header
-            Constraint::Min(3),                    // conversation
-            Constraint::Length(suggestion_height), // slash palette
-            Constraint::Length(input_lines + 2),   // input (border top/bottom)
-            Constraint::Length(1),                 // status
+            Constraint::Min(tail_height),
+            Constraint::Length(spinner_height),
+            Constraint::Length(suggestion_height),
+            Constraint::Length(picker_height),
+            Constraint::Length(input_lines + 2),
+            Constraint::Length(1),
         ])
         .split(area);
 
-    draw_header(frame, chunks[0], state);
-    draw_conversation(frame, chunks[1], state);
+    draw_live_tail(frame, chunks[0], state, width);
+    if spinner_height > 0 {
+        draw_spinner(frame, chunks[1], state);
+    }
     if suggestion_height > 0 {
         draw_suggestions(frame, chunks[2], state);
     }
-    draw_input(frame, chunks[3], state);
-    draw_status(frame, chunks[4], state);
+    if let Some(confirm) = &state.confirm {
+        draw_confirm_menu(frame, chunks[3], confirm);
+    } else if let Some(picker) = &state.session_picker {
+        draw_session_picker(frame, chunks[3], picker);
+    }
+    draw_input(frame, chunks[4], state);
+    draw_status(frame, chunks[5], state);
 }
 
-fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
-    let line = Line::from(vec![
-        Span::styled(" insane-cli ", theme::brand()),
-        Span::styled(format!(" {} ", state.mode.label()), theme::mode(state.mode)),
-        Span::styled(
-            format!("  {}/{}  ", state.provider, state.model),
-            theme::header(),
-        ),
-        Span::styled(format!(" {} ", state.cwd_display), theme::header_dim()),
-    ]);
-    let p = Paragraph::new(line).style(theme::header());
-    frame.render_widget(p, area);
+pub(crate) fn desired_inline_height(state: &AppState, width: usize) -> u16 {
+    let input_width = width.saturating_sub(4).max(1);
+    let (visual_input, _) = input_layout(&state.input, state.cursor, input_width);
+    let input_lines = visual_input.len().max(1).min(MAX_INPUT_LINES as usize) as u16;
+    let suggestions = state.suggestions();
+    let suggestion_height = if suggestions.is_empty() {
+        0
+    } else {
+        suggestions.len().min(4) as u16 + 1
+    };
+    let picker_height = if let Some(confirm) = &state.confirm {
+        confirm.option_count() as u16 + 1
+    } else if let Some(picker) = &state.session_picker {
+        picker.sessions.len().min(3) as u16 + 2
+    } else {
+        0
+    };
+    let spinner_height = if state.processing || state.status.spinner_line.is_some() {
+        1
+    } else {
+        0
+    };
+    let live_height = live_tail_lines(state, width)
+        .len()
+        .min(LIVE_TAIL_BUDGET) as u16;
+    (live_height + spinner_height + suggestion_height + picker_height + input_lines + 3)
+        .clamp(MIN_INLINE_HEIGHT, MAX_INLINE_HEIGHT)
 }
 
-#[derive(Clone)]
-struct StyledSegment {
-    text: String,
-    style: Style,
-}
-
-#[derive(Clone)]
-struct StyledChar {
-    ch: char,
-    style: Style,
-}
-
-fn block_lines(msg: &MsgBlock, width: usize, show_thinking: bool) -> Vec<Line<'static>> {
+pub(crate) fn block_lines(
+    msg: &MsgBlock,
+    width: usize,
+    show_thinking: bool,
+) -> Vec<Line<'static>> {
     match msg {
-        MsgBlock::User(text) => wrap_text(&format!("you: {text}"), width)
-            .into_iter()
-            .map(|l| Line::from(Span::styled(l, theme::user())))
-            .collect(),
+        MsgBlock::User(text) => user_lines(text, width),
         MsgBlock::Assistant(text) if text.is_empty() => Vec::new(),
         MsgBlock::Assistant(text) => assistant_lines(text, width),
         MsgBlock::Thinking(text) if text.trim().is_empty() => Vec::new(),
         MsgBlock::Thinking(_) if !show_thinking => thinking_placeholder_lines(width),
         MsgBlock::Thinking(text) => thinking_lines(text, width),
-        MsgBlock::Tool { status, line } => {
-            let (marker, style) = match status {
-                ToolStatus::Running => ("\u{25c7}", theme::tool_running()),
-                ToolStatus::Success => ("\u{2514}", theme::success()),
-                ToolStatus::Failed => ("\u{2514}", theme::danger()),
-            };
-            wrap_text(line, width)
-                .into_iter()
-                .enumerate()
-                .map(|(idx, l)| {
-                    let prefix = if idx == 0 { marker } else { " " };
-                    Line::from(Span::styled(format!("  {prefix} {l}"), style))
-                })
-                .collect()
-        }
+        MsgBlock::Tool {
+            status,
+            call,
+            result,
+        } => tool_lines(*status, call, result.as_deref(), width),
         MsgBlock::Warn(text) => wrap_text(&format!("! {text}"), width)
             .into_iter()
             .map(|l| Line::from(Span::styled(l, theme::warning())))
@@ -149,19 +135,96 @@ fn block_lines(msg: &MsgBlock, width: usize, show_thinking: bool) -> Vec<Line<'s
     }
 }
 
+pub(crate) fn live_tail_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (idx, msg) in state.messages.iter().enumerate().skip(state.committed_blocks) {
+        if idx == state.committed_blocks && state.live_committed_chars > 0 {
+            if let MsgBlock::Assistant(text) = msg {
+                if let Some(tail) = text.get(state.live_committed_chars..) {
+                    lines.extend(assistant_lines(tail, width));
+                }
+                continue;
+            }
+        }
+        lines.extend(block_lines(msg, width, state.show_thinking));
+    }
+    lines
+}
+
+pub(crate) fn confirm_transcript_lines(
+    pending: &PendingConfirm,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut lines: Vec<Line<'static>> = wrap_text(&pending.req.prompt, width)
+        .into_iter()
+        .map(|line| {
+            Line::from(Span::styled(
+                line,
+                theme::assistant().add_modifier(Modifier::BOLD),
+            ))
+        })
+        .collect();
+
+    if let Some(details) = &pending.req.details {
+        lines.push(Line::from(""));
+        lines.extend(
+            wrap_text(details, width)
+                .into_iter()
+                .map(|line| Line::from(Span::styled(line, theme::warning()))),
+        );
+    }
+
+    if let Some(command) = &pending.req.command {
+        lines.push(Line::from(""));
+        lines.extend(
+            wrap_text(command, width.saturating_sub(2))
+                .into_iter()
+                .map(|line| Line::from(Span::styled(format!("$ {line}"), theme::warning()))),
+        );
+    }
+
+    if let Some(diff) = &pending.req.diff {
+        lines.push(Line::from(""));
+        for (kind, line) in diff_lines_for_modal(diff) {
+            let style = match kind {
+                DiffLineKind::Add => theme::success(),
+                DiffLineKind::Del => theme::danger(),
+                DiffLineKind::Meta => theme::brand(),
+                DiffLineKind::Context => theme::muted(),
+            };
+            lines.extend(
+                wrap_text(line, width)
+                    .into_iter()
+                    .map(|wrapped| Line::from(Span::styled(wrapped, style))),
+            );
+        }
+    }
+
+    lines
+}
+
+fn user_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    wrap_text(text, width.saturating_sub(2).max(1))
+        .into_iter()
+        .map(|line| {
+            Line::from(vec![
+                Span::styled("> ", theme::user_prompt()),
+                Span::styled(line, theme::user_prompt()),
+            ])
+        })
+        .collect()
+}
+
 fn assistant_lines(text: &str, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     let mut lines = Vec::new();
-    for (idx, raw_line) in text.split('\n').enumerate() {
-        let mut segments = Vec::new();
-        if idx == 0 {
-            segments.push(StyledSegment {
-                text: "insane: ".to_string(),
-                style: theme::assistant(),
-            });
+    for raw_line in text.split('\n') {
+        if raw_line.chars().next().is_some_and(|c| c.is_whitespace()) {
+            lines.extend(wrap_preserving_spaces(raw_line, theme::assistant(), width));
+        } else {
+            lines.extend(wrap_styled_segments(parse_assistant_markup(raw_line), width));
         }
-        segments.extend(parse_assistant_markup(raw_line));
-        lines.extend(wrap_styled_segments(segments, width));
     }
     lines
 }
@@ -194,6 +257,55 @@ fn thinking_placeholder_lines(width: usize) -> Vec<Line<'static>> {
         }],
         width.max(1),
     )
+}
+
+fn tool_lines(
+    status: ToolStatus,
+    call: &str,
+    result: Option<&str>,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let call_width = width.saturating_sub(2).max(1);
+    for (idx, wrapped) in wrap_text(call, call_width).into_iter().enumerate() {
+        if idx == 0 {
+            lines.push(Line::from(vec![
+                Span::styled("● ", theme::bullet(status)),
+                Span::styled(wrapped, theme::assistant()),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(wrapped, theme::assistant()),
+            ]));
+        }
+    }
+    if let Some(result) = result {
+        let summary = truncate_summary(result, width.saturating_sub(5).max(1));
+        for (idx, wrapped) in wrap_text(&summary, width.saturating_sub(5).max(1))
+            .into_iter()
+            .enumerate()
+        {
+            let prefix = if idx == 0 { "  ⎿  " } else { "     " };
+            lines.push(Line::from(vec![
+                Span::styled(prefix, theme::tool_result()),
+                Span::styled(wrapped, theme::tool_result()),
+            ]));
+        }
+    }
+    lines
+}
+
+#[derive(Clone)]
+struct StyledSegment {
+    text: String,
+    style: Style,
+}
+
+#[derive(Clone)]
+struct StyledChar {
+    ch: char,
+    style: Style,
 }
 
 fn parse_assistant_markup(line: &str) -> Vec<StyledSegment> {
@@ -247,6 +359,23 @@ fn wrap_styled_segments(segments: Vec<StyledSegment>, width: usize) -> Vec<Line<
         }
     }
     wrap_styled_chars(chars, width)
+}
+
+fn wrap_preserving_spaces(text: &str, style: Style, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    if text.is_empty() {
+        return vec![Line::from("")];
+    }
+    let mut wrapped = Vec::new();
+    let mut current = Vec::new();
+    for ch in text.chars() {
+        if current.len() == width {
+            wrapped.push(std::mem::take(&mut current));
+        }
+        current.push(StyledChar { ch, style });
+    }
+    wrapped.push(current);
+    wrapped.into_iter().map(line_from_styled_chars).collect()
 }
 
 fn wrap_styled_chars(chars: Vec<StyledChar>, width: usize) -> Vec<Line<'static>> {
@@ -332,31 +461,36 @@ fn line_from_styled_chars(chars: Vec<StyledChar>) -> Line<'static> {
     Line::from(spans)
 }
 
-fn draw_conversation(frame: &mut Frame, area: Rect, state: &AppState) {
-    let width = area.width.saturating_sub(2).max(1) as usize;
-    let mut all_lines: Vec<Line<'static>> = Vec::new();
-    for msg in &state.messages {
-        all_lines.extend(block_lines(msg, width, state.show_thinking));
+fn draw_live_tail(frame: &mut Frame, area: Rect, state: &AppState, width: usize) {
+    if area.height == 0 {
+        return;
     }
+    let lines = live_tail_lines(state, width);
+    let start = lines.len().saturating_sub(area.height as usize);
+    frame.render_widget(
+        Paragraph::new(lines[start..].to_vec()).wrap(Wrap { trim: false }),
+        area,
+    );
+}
 
-    let viewport_height = area.height.saturating_sub(2) as usize;
-    let total = all_lines.len();
-    let scroll = super::format::clamp_scroll(total, viewport_height, state.scroll);
-    // `scroll` is "lines scrolled up from the bottom".
-    let bottom_excluded = scroll;
-    let end = total.saturating_sub(bottom_excluded);
-    let start = end.saturating_sub(viewport_height);
-    let visible: Vec<Line<'static>> = all_lines[start..end].to_vec();
-
-    let title = if scroll > 0 {
-        "conversation (scrolled)"
+fn draw_spinner(frame: &mut Frame, area: Rect, state: &AppState) {
+    let work = state
+        .status
+        .spinner_line
+        .clone()
+        .unwrap_or_else(|| "Working...".to_string());
+    let suffix = if state.processing {
+        " (esc to interrupt)"
     } else {
-        "conversation"
+        ""
     };
-    let p = Paragraph::new(visible)
-        .block(theme::block(title))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(p, area);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("✻ ", theme::thinking_label()),
+            Span::styled(format!("{work}{suffix}"), theme::muted()),
+        ])),
+        area,
+    );
 }
 
 fn draw_suggestions(frame: &mut Frame, area: Rect, state: &AppState) {
@@ -364,12 +498,12 @@ fn draw_suggestions(frame: &mut Frame, area: Rect, state: &AppState) {
     let selected = state
         .suggestion_idx
         .min(suggestions.len().saturating_sub(1));
-    let start = selected.saturating_sub(5);
+    let start = selected.saturating_sub(3);
     let lines: Vec<Line<'static>> = suggestions
         .iter()
         .enumerate()
         .skip(start)
-        .take(6)
+        .take(4)
         .map(|(idx, suggestion)| {
             let style = if idx == selected {
                 theme::selected()
@@ -377,7 +511,8 @@ fn draw_suggestions(frame: &mut Frame, area: Rect, state: &AppState) {
                 theme::assistant()
             };
             Line::from(vec![
-                Span::styled(format!(" {:<32}", suggestion.label), style),
+                Span::styled(if idx == selected { "› " } else { "  " }, style),
+                Span::styled(format!("{:<28}", suggestion.label), style),
                 Span::styled(
                     format!("  {}", suggestion.description),
                     if idx == selected {
@@ -389,44 +524,44 @@ fn draw_suggestions(frame: &mut Frame, area: Rect, state: &AppState) {
             ])
         })
         .collect();
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(theme::panel())
-            .block(theme::block(
-                " commands / @files  \u{2191}/\u{2193} select  Tab complete ",
-            )),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, state: &AppState) {
-    let width = area.width.saturating_sub(2).max(1) as usize;
+    let width = area.width.saturating_sub(4).max(1) as usize;
     let (lines, (cursor_row, cursor_col)) = input_layout(&state.input, state.cursor, width);
     let inner_height = area.height.saturating_sub(2).max(1) as usize;
     let start = cursor_row.saturating_sub(inner_height.saturating_sub(1));
     let end = (start + inner_height).min(lines.len());
-    let text = lines[start..end].join("\n");
+    let display: Vec<String> = lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(idx, line)| {
+            if start + idx == 0 {
+                format!("> {line}")
+            } else {
+                format!("  {line}")
+            }
+        })
+        .collect();
     let title = if state.processing {
-        "input (turn in progress -- Ctrl+C cancel, Ctrl+O toggle thinking)"
+        " esc interrupt  ctrl+o thinking "
     } else {
-        "input  Enter send  Alt+Enter newline  Shift+Tab mode  Ctrl+O toggle thinking"
+        " enter send  alt+enter newline "
     };
-    let p = Paragraph::new(text)
+    let p = Paragraph::new(display.join("\n"))
         .style(theme::assistant())
-        .block(theme::block(title))
+        .block(theme::block(title).border_type(BorderType::Rounded))
         .wrap(Wrap { trim: false });
     frame.render_widget(p, area);
 
     if !state.processing && state.confirm.is_none() && state.session_picker.is_none() {
         let row = cursor_row.saturating_sub(start) as u16;
-        let col = (cursor_col as u16).min(area.width.saturating_sub(2));
-        frame.set_cursor_position(Position::new(area.x + 1 + col, area.y + 1 + row));
+        let col = (cursor_col as u16).min(area.width.saturating_sub(4));
+        frame.set_cursor_position(Position::new(area.x + 3 + col, area.y + 1 + row));
     }
 }
 
-/// Hard-wraps input so rendered text and cursor coordinates use exactly the
-/// same rules. `wrap_text` is word-oriented and therefore unsuitable for an
-/// editor cursor in the middle of a word.
 fn input_layout(input: &str, cursor: usize, width: usize) -> (Vec<String>, (usize, usize)) {
     let width = width.max(1);
     let mut lines = vec![String::new()];
@@ -468,33 +603,23 @@ fn input_layout(input: &str, cursor: usize, width: usize) -> (Vec<String>, (usiz
 
 fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
     let mut spans = Vec::new();
-    if let Some(line) = &state.status.spinner_line {
-        spans.push(Span::styled(line.clone(), theme::muted()));
+    match state.mode {
+        super::app::InteractionMode::Plan => {
+            spans.push(Span::styled(
+                "⏸ plan mode on (shift+tab to cycle)",
+                theme::mode_text(state.mode),
+            ));
+        }
+        mode => {
+            spans.push(Span::styled("mode ", theme::subtle()));
+            spans.push(Span::styled(mode.label(), theme::mode_text(mode)));
+        }
     }
-    if !spans.is_empty() {
-        spans.push(Span::styled("  \u{b7}  ", theme::subtle()));
-    }
-    spans.push(Span::styled("mode ", theme::subtle()));
-    spans.push(Span::styled(
-        state.mode.label(),
-        theme::mode_text(state.mode),
-    ));
+    push_status_part(&mut spans, format!("{}/{}", state.provider, state.model));
     if let (Some(used), Some(cap)) = (state.status.rate_used, state.status.rate_capacity) {
         push_status_part(&mut spans, format!("rate {used}/{cap}"));
     } else if let Some(used) = state.status.rate_used {
         push_status_part(&mut spans, format!("rate {used}/∞"));
-    }
-    if state.status.min_interval_ms > 0 {
-        push_status_part(
-            &mut spans,
-            format!("pace {}ms", state.status.min_interval_ms),
-        );
-    }
-    if state.status.next_request_ms > 0 {
-        push_status_part(
-            &mut spans,
-            format!("next {}ms", state.status.next_request_ms),
-        );
     }
     let token_text = match (state.status.tokens_this_turn, state.status.tokens_total) {
         (Some(tok), total) if total > 0 => format!(
@@ -508,82 +633,25 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
         }
         (None, _) => "tok --".to_string(),
     };
-    let command_hint =
-        format!("{token_text}  Shift+Tab mode  Ctrl+O toggle thinking  Ctrl+C cancel/exit  /help");
-    push_status_part(&mut spans, command_hint);
-    let p = Paragraph::new(Line::from(spans)).style(theme::muted());
-    frame.render_widget(p, area);
+    push_status_part(&mut spans, token_text);
+    push_status_part(&mut spans, "ctrl+c exit/cancel  /help".to_string());
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(theme::muted()), area);
 }
 
 fn push_status_part(spans: &mut Vec<Span<'static>>, text: String) {
-    spans.push(Span::styled("  \u{b7}  ", theme::subtle()));
+    spans.push(Span::styled("  ·  ", theme::subtle()));
     spans.push(Span::styled(text, theme::muted()));
 }
 
-fn draw_approval_panel(frame: &mut Frame, area: Rect, pending: &super::app::PendingConfirm) {
-    let width = area.width.saturating_sub(4).max(1) as usize;
-    let mut lines: Vec<Line<'static>> = wrap_text(&pending.req.prompt, width)
-        .into_iter()
-        .map(|line| {
-            Line::from(Span::styled(
-                line,
-                theme::assistant().add_modifier(Modifier::BOLD),
-            ))
-        })
-        .collect();
-    lines.push(Line::from(""));
-
-    if let Some(details) = &pending.req.details {
-        for line in wrap_text(details, width) {
-            lines.push(Line::from(Span::styled(line, theme::warning())));
-        }
-        lines.push(Line::from(""));
-    }
-
-    if let Some(command) = &pending.req.command {
-        for line in wrap_text(command, width) {
-            lines.push(Line::from(Span::styled(
-                format!("$ {line}"),
-                theme::warning(),
-            )));
-        }
-    }
-    if let Some(diff) = &pending.req.diff {
-        for (kind, line) in diff_lines_for_modal(diff) {
-            let color = match kind {
-                DiffLineKind::Add => theme::SUCCESS,
-                DiffLineKind::Del => theme::DANGER,
-                DiffLineKind::Meta => theme::ACCENT,
-                DiffLineKind::Context => theme::MUTED,
-            };
-            for wrapped in wrap_text(line, width) {
-                lines.push(Line::from(Span::styled(
-                    wrapped,
-                    Style::default().fg(color).bg(theme::BG),
-                )));
-            }
-        }
-    }
-
-    let option_labels: Vec<&str> = if pending.option_count() == 2 {
-        vec!["Allow once", "Deny"]
-    } else if pending.req.tool == "run_command" {
-        vec!["Allow once", "Allow this exact command for session", "Deny"]
-    } else {
-        vec!["Allow once", "Allow this tool for session", "Deny"]
-    };
-
-    let viewport_height = area.height.saturating_sub(option_labels.len() as u16 + 4) as usize;
-    let total = lines.len();
-    let scroll = super::format::clamp_scroll(total, viewport_height, pending.scroll);
-    let start = scroll;
-    let end = (start + viewport_height).min(total);
-    let mut visible = lines[start..end].to_vec();
-    visible.push(Line::from(Span::styled("─".repeat(width), theme::subtle())));
-    for (idx, label) in option_labels.iter().enumerate() {
+fn draw_confirm_menu(frame: &mut Frame, area: Rect, pending: &PendingConfirm) {
+    let mut lines = vec![Line::from(Span::styled(
+        format!("approve: {}", pending.req.tool),
+        theme::warning().add_modifier(Modifier::BOLD),
+    ))];
+    for (idx, label) in option_labels(pending).iter().enumerate() {
         let selected = idx == pending.selected;
-        visible.push(Line::from(Span::styled(
-            format!(" {} {label}", if selected { "›" } else { " " }),
+        lines.push(Line::from(Span::styled(
+            format!("{} {label}", if selected { "›" } else { " " }),
             if selected {
                 theme::selected()
             } else {
@@ -591,62 +659,51 @@ fn draw_approval_panel(frame: &mut Frame, area: Rect, pending: &super::app::Pend
             },
         )));
     }
+    frame.render_widget(Paragraph::new(lines), area);
+}
 
-    let p = Paragraph::new(visible)
-        .style(theme::panel())
-        .block(theme::block(format!(
-            " approve: {}  ↑/↓ select  Enter confirm  Esc deny  PgUp/PgDn preview ",
-            pending.req.tool
-        )))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(p, area);
+fn option_labels(pending: &PendingConfirm) -> Vec<&'static str> {
+    if pending.option_count() == 2 {
+        vec!["Allow once", "Deny"]
+    } else if pending.req.tool == "run_command" {
+        vec!["Allow once", "Allow this exact command for session", "Deny"]
+    } else {
+        vec!["Allow once", "Allow this tool for session", "Deny"]
+    }
 }
 
 fn draw_session_picker(frame: &mut Frame, area: Rect, picker: &PendingSessionPicker) {
-    let width = area.width.saturating_sub(4).max(1) as usize;
     let mut lines = vec![Line::from(Span::styled(
-        "Escolha uma sessao para retomar",
+        "resume session",
         theme::assistant().add_modifier(Modifier::BOLD),
     ))];
-    lines.push(Line::from(""));
-
-    for (idx, session) in picker.sessions.iter().enumerate() {
+    let start = picker.selected.saturating_sub(1);
+    for (idx, session) in picker.sessions.iter().enumerate().skip(start).take(3) {
         let selected = idx == picker.selected;
-        let marker = if selected { "›" } else { " " };
-        let text = format!(
-            " {} {}. {} mensagens · {} · {}",
-            marker,
-            idx + 1,
-            session.messages,
-            session.model,
-            session.preview
-        );
-        for wrapped in wrap_text(&text, width) {
-            lines.push(Line::from(Span::styled(
-                wrapped,
-                if selected {
-                    theme::selected()
-                } else {
-                    theme::assistant()
-                },
-            )));
-        }
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} {}. {} mensagens · {} · {}",
+                if selected { "›" } else { " " },
+                idx + 1,
+                session.messages,
+                session.model,
+                session.preview
+            ),
+            if selected {
+                theme::selected()
+            } else {
+                theme::assistant()
+            },
+        )));
     }
-
-    let p = Paragraph::new(lines)
-        .style(theme::panel())
-        .block(theme::block(
-            " resume  ↑/↓ select  Enter resume  Esc close ",
-        ))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(p, area);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{assistant_lines, block_lines, draw, input_layout};
+    use super::{assistant_lines, block_lines, desired_inline_height, draw_inline, input_layout};
     use crate::session_store::SessionSummary;
-    use crate::tui::app::{AppState, MsgBlock, PendingConfirm, PendingSessionPicker};
+    use crate::tui::app::{AppState, MsgBlock, PendingConfirm, PendingSessionPicker, ToolStatus};
     use crate::tui::theme;
     use crate::ui::ConfirmRequest;
     use ratatui::backend::TestBackend;
@@ -674,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_is_rendered_in_bottom_layout() {
+    fn approval_menu_is_rendered_inline() {
         let mut state = AppState::new("model".into(), ".".into(), ".".into());
         let (tx, _rx) = tokio::sync::oneshot::channel();
         state.confirm = Some(PendingConfirm {
@@ -686,12 +743,12 @@ mod tests {
                 command: None,
             },
             responder: tx,
-            scroll: 0,
+            printed: true,
             selected: 0,
         });
-        let backend = TestBackend::new(80, 24);
+        let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        terminal.draw(|frame| draw_inline(frame, &state)).unwrap();
         let rendered: String = terminal
             .backend()
             .buffer()
@@ -706,7 +763,7 @@ mod tests {
     #[test]
     fn assistant_markdown_heading_is_rendered_without_marker_and_highlighted() {
         let lines = assistant_lines("## Exemplo", 80);
-        assert_eq!(line_text(&lines[0]), "insane: Exemplo");
+        assert_eq!(line_text(&lines[0]), "Exemplo");
 
         let highlighted: String = lines[0]
             .spans
@@ -720,7 +777,7 @@ mod tests {
     #[test]
     fn assistant_markdown_bold_segments_drop_markers() {
         let lines = assistant_lines("texto **um** e **dois** fim", 80);
-        assert_eq!(line_text(&lines[0]), "insane: texto um e dois fim");
+        assert_eq!(line_text(&lines[0]), "texto um e dois fim");
 
         let highlighted: String = lines[0]
             .spans
@@ -734,69 +791,37 @@ mod tests {
     #[test]
     fn assistant_markdown_incomplete_marker_is_preserved() {
         let lines = assistant_lines("foo **bar", 80);
-        assert_eq!(line_text(&lines[0]), "insane: foo **bar");
+        assert_eq!(line_text(&lines[0]), "foo **bar");
     }
 
     #[test]
     fn indented_hashes_are_not_treated_as_headings() {
         let lines = assistant_lines("    ## comentario", 80);
-        assert_eq!(line_text(&lines[0]), "insane:     ## comentario");
+        assert_eq!(line_text(&lines[0]), "    ## comentario");
     }
 
     #[test]
-    fn assistant_markdown_markers_are_stripped_in_rendered_conversation() {
-        let mut state = AppState::new("model".into(), ".".into(), ".".into());
-        state.messages.push(MsgBlock::Assistant(
-            "## Plano\nUse **cargo test** agora".into(),
-        ));
+    fn block_lines_uses_claude_code_style_prefixes() {
+        let user = block_lines(&MsgBlock::User("hello".into()), 80, true);
+        assert_eq!(line_text(&user[0]), "> hello");
 
-        let backend = TestBackend::new(80, 16);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &state)).unwrap();
-        let rendered: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
-
-        assert!(rendered.contains("insane: Plano"));
-        assert!(rendered.contains("Use cargo test agora"));
-        assert!(!rendered.contains("## Plano"));
-        assert!(!rendered.contains("**cargo test**"));
+        let tool = block_lines(
+            &MsgBlock::Tool {
+                status: ToolStatus::Success,
+                call: "read_file(src/lib.rs)".into(),
+                result: Some("ok in 3ms".into()),
+            },
+            80,
+            true,
+        );
+        assert_eq!(line_text(&tool[0]), "● read_file(src/lib.rs)");
+        assert_eq!(line_text(&tool[1]), "  ⎿  ok in 3ms");
     }
 
     #[test]
     fn thinking_block_shows_placeholder_when_toggled_off() {
-        let mut state = AppState::new("model".into(), ".".into(), ".".into());
-        state
-            .messages
-            .push(MsgBlock::Thinking("private thought".into()));
-        state.show_thinking = false;
-        let backend = TestBackend::new(80, 12);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &state)).unwrap();
-        let hidden: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
-        assert!(!hidden.contains("private thought"));
-        assert!(hidden.contains("thinking..."));
-
-        state.show_thinking = true;
-        terminal.draw(|frame| draw(frame, &state)).unwrap();
-        let visible: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
-        assert!(visible.contains("thinking: private thought"));
+        let lines = block_lines(&MsgBlock::Thinking("private thought".into()), 80, false);
+        assert_eq!(line_text(&lines[0]), "thinking...");
     }
 
     #[test]
@@ -808,14 +833,18 @@ mod tests {
     }
 
     #[test]
-    fn thinking_placeholder_uses_label_style() {
-        let lines = block_lines(&MsgBlock::Thinking("private thought".into()), 80, false);
-        assert_eq!(line_text(&lines[0]), "thinking...");
-        assert_eq!(lines[0].spans[0].style, theme::thinking_label());
+    fn desired_inline_height_grows_with_multiline_input_and_caps() {
+        let mut state = AppState::new("model".into(), ".".into(), ".".into());
+        let short = desired_inline_height(&state, 80);
+        state.set_input("a\nb\nc\nd\ne\nf".into());
+        let tall = desired_inline_height(&state, 80);
+
+        assert!(tall > short);
+        assert!(tall <= 15);
     }
 
     #[test]
-    fn session_picker_is_rendered_in_bottom_layout() {
+    fn session_picker_is_rendered_inline() {
         let mut state = AppState::new("model".into(), ".".into(), ".".into());
         state.session_picker = Some(PendingSessionPicker {
             sessions: vec![SessionSummary {
@@ -826,9 +855,9 @@ mod tests {
             }],
             selected: 0,
         });
-        let backend = TestBackend::new(80, 24);
+        let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        terminal.draw(|frame| draw_inline(frame, &state)).unwrap();
         let rendered: String = terminal
             .backend()
             .buffer()
@@ -836,7 +865,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(rendered.contains("resume"));
+        assert!(rendered.contains("resume session"));
         assert!(rendered.contains("primeira pergunta"));
     }
 }

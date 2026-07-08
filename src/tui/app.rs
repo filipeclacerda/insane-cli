@@ -77,7 +77,7 @@ pub enum ToolStatus {
     Failed,
 }
 
-/// One entry in the conversation viewport.
+/// One entry in the transcript.
 #[derive(Debug, Clone)]
 pub enum MsgBlock {
     User(String),
@@ -86,10 +86,11 @@ pub enum MsgBlock {
     /// Provider-supplied model reasoning/thinking; shown by default and
     /// replaced by a compact placeholder when toggled off.
     Thinking(String),
-    /// A tool call trace/result line, e.g. `✓ read_file agent.rs (14.2 KB, 3ms)`.
+    /// A tool call trace/result, rendered as a Claude Code-style bullet.
     Tool {
         status: ToolStatus,
-        line: String,
+        call: String,
+        result: Option<String>,
     },
     /// A warning/notice (finish_reason, rate limit, recovered text call).
     Warn(String),
@@ -102,8 +103,8 @@ pub enum MsgBlock {
 pub struct PendingConfirm {
     pub req: ConfirmRequest,
     pub responder: tokio::sync::oneshot::Sender<crate::ui::Decision>,
-    /// Scroll offset into a long diff/command, in lines.
-    pub scroll: usize,
+    /// The prompt/details/diff are printed into native scrollback once.
+    pub printed: bool,
     /// Highlighted decision in the bottom approval picker.
     pub selected: usize,
 }
@@ -170,8 +171,14 @@ pub struct AppState {
     pub history_idx: Option<usize>,
     /// Currently highlighted entry in the live slash-command palette.
     pub suggestion_idx: usize,
-    /// Lines scrolled up from the bottom of the conversation viewport.
-    pub scroll: usize,
+    /// Blocks before this index have already been pushed into native scrollback.
+    pub committed_blocks: usize,
+    /// Bytes of the current live assistant block already pushed into scrollback.
+    pub live_committed_chars: usize,
+    /// The inline viewport should be rebuilt on the next render tick.
+    pub viewport_reset_requested: bool,
+    /// The terminal scrollback/screen should be purged on the next render tick.
+    pub terminal_purge_requested: bool,
     pub show_thinking: bool,
     pub processing: bool,
     pub status: StatusInfo,
@@ -201,7 +208,10 @@ impl AppState {
             input_history: Vec::new(),
             history_idx: None,
             suggestion_idx: 0,
-            scroll: 0,
+            committed_blocks: 0,
+            live_committed_chars: 0,
+            viewport_reset_requested: false,
+            terminal_purge_requested: false,
             show_thinking: true,
             processing: false,
             status: StatusInfo::default(),
@@ -265,6 +275,18 @@ impl AppState {
             .iter()
             .rposition(|msg| matches!(msg, MsgBlock::Assistant(text) if !text.trim().is_empty()));
         if let Some(idx) = last_idx {
+            if self.live_committed_chars > 0 {
+                if let MsgBlock::Assistant(text) = &mut self.messages[idx] {
+                    let cut = clamp_to_char_boundary(text, self.live_committed_chars);
+                    text.truncate(cut);
+                }
+                self.messages.push(MsgBlock::Warn(
+                    "assistant text already printed to scrollback; only the live tail was removed"
+                        .to_string(),
+                ));
+                self.dirty = true;
+                return;
+            }
             self.messages.remove(idx);
             self.dirty = true;
         }
@@ -275,6 +297,22 @@ impl AppState {
             .messages
             .iter()
             .rposition(|msg| matches!(msg, MsgBlock::Assistant(existing) if !existing.is_empty()));
+        if self.live_committed_chars > 0 {
+            if let Some(idx) = last_idx {
+                if let MsgBlock::Assistant(existing) = &mut self.messages[idx] {
+                    let cut = clamp_to_char_boundary(existing, self.live_committed_chars);
+                    let replacement_tail = text.get(cut..).unwrap_or("");
+                    existing.truncate(cut);
+                    existing.push_str(replacement_tail);
+                    self.messages.push(MsgBlock::Warn(
+                        "assistant text already printed to scrollback; only the live tail was replaced"
+                            .to_string(),
+                    ));
+                    self.dirty = true;
+                    return;
+                }
+            }
+        }
         match (last_idx, text.trim().is_empty()) {
             (Some(idx), true) => {
                 self.messages.remove(idx);
@@ -299,15 +337,16 @@ impl AppState {
         }
     }
 
-    pub fn push_tool_running(&mut self, line: String) {
+    pub fn push_tool_running(&mut self, call: String) {
         self.messages.push(MsgBlock::Tool {
             status: ToolStatus::Running,
-            line,
+            call,
+            result: None,
         });
         self.dirty = true;
     }
 
-    pub fn finish_tool(&mut self, ok: bool, line: String) {
+    pub fn finish_tool(&mut self, ok: bool, call: String, result: String) {
         let running = self.messages.iter().rposition(|msg| {
             matches!(
                 msg,
@@ -324,7 +363,8 @@ impl AppState {
                 } else {
                     ToolStatus::Failed
                 },
-                line,
+                call,
+                result: Some(result),
             };
         } else {
             self.messages.push(MsgBlock::Tool {
@@ -333,7 +373,8 @@ impl AppState {
                 } else {
                     ToolStatus::Failed
                 },
-                line,
+                call,
+                result: Some(result),
             });
         }
         self.dirty = true;
@@ -662,10 +703,44 @@ impl AppState {
 
     pub fn clear_conversation(&mut self) {
         self.messages.clear();
-        self.scroll = 0;
+        self.committed_blocks = 0;
+        self.live_committed_chars = 0;
         self.status.tokens_this_turn = None;
         self.status.tokens_total = 0;
         self.dirty = true;
+    }
+
+    pub fn request_viewport_reset(&mut self) {
+        self.viewport_reset_requested = true;
+        self.dirty = true;
+    }
+
+    pub fn request_terminal_purge(&mut self) {
+        self.terminal_purge_requested = true;
+        self.request_viewport_reset();
+    }
+
+    pub fn commit_frontier(&self) -> usize {
+        if !self.processing {
+            return self.messages.len();
+        }
+
+        let mut frontier = self.messages.len();
+        while frontier > 0 {
+            match &self.messages[frontier - 1] {
+                MsgBlock::Assistant(_) | MsgBlock::Thinking(_) => {
+                    frontier -= 1;
+                }
+                MsgBlock::Tool {
+                    status: ToolStatus::Running,
+                    ..
+                } => {
+                    return frontier - 1;
+                }
+                _ => break,
+            }
+        }
+        frontier
     }
 
     pub fn set_usage(&mut self, usage: Option<&Usage>) -> u64 {
@@ -699,6 +774,14 @@ fn byte_index_for_char(text: &str, char_index: usize) -> usize {
         .nth(char_index)
         .map(|(idx, _)| idx)
         .unwrap_or(text.len())
+}
+
+fn clamp_to_char_boundary(text: &str, mut byte_index: usize) -> usize {
+    byte_index = byte_index.min(text.len());
+    while byte_index > 0 && !text.is_char_boundary(byte_index) {
+        byte_index -= 1;
+    }
+    byte_index
 }
 
 #[cfg(test)]
@@ -750,6 +833,28 @@ mod tests {
     }
 
     #[test]
+    fn commit_frontier_keeps_live_stream_tail_while_processing() {
+        let mut app = AppState::new("m".into(), ".".into(), ".".into());
+        app.push_user("hi".into());
+        app.push_assistant_chunk("live");
+        app.processing = true;
+
+        assert_eq!(app.commit_frontier(), 1);
+        app.processing = false;
+        assert_eq!(app.commit_frontier(), 2);
+    }
+
+    #[test]
+    fn commit_frontier_stops_before_running_tool() {
+        let mut app = AppState::new("m".into(), ".".into(), ".".into());
+        app.push_user("hi".into());
+        app.push_tool_running("read_file(src/lib.rs)".into());
+        app.processing = true;
+
+        assert_eq!(app.commit_frontier(), 1);
+    }
+
+    #[test]
     fn replaces_last_assistant_message_with_cleaned_text() {
         let mut app = AppState::new("m".into(), ".".into(), ".".into());
         app.push_assistant_chunk("Vou ler.\n{\"name\":\"read_file\"}");
@@ -764,6 +869,24 @@ mod tests {
             .messages
             .iter()
             .any(|msg| matches!(msg, MsgBlock::Assistant(text) if text.contains("read_file"))));
+    }
+
+    #[test]
+    fn replace_after_partial_live_commit_keeps_committed_prefix() {
+        let mut app = AppState::new("m".into(), ".".into(), ".".into());
+        app.push_assistant_chunk("prefix\nbad tool json");
+        app.live_committed_chars = "prefix\n".len();
+
+        app.replace_last_assistant_message("prefix\nclean tail");
+
+        assert!(matches!(
+            app.messages.first(),
+            Some(MsgBlock::Assistant(text)) if text == "prefix\nclean tail"
+        ));
+        assert!(app
+            .messages
+            .iter()
+            .any(|msg| matches!(msg, MsgBlock::Warn(text) if text.contains("live tail"))));
     }
 
     #[test]

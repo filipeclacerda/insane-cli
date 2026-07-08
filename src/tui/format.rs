@@ -1,7 +1,7 @@
 //! Pure formatting/layout helpers for the TUI (SPEC-UX B2/B3/B4): text
-//! wrapping, diff-line classification for the confirmation modal, and
-//! scroll-offset clamping. Kept free of any rendering/terminal dependency so
-//! they're directly unit-testable (SPEC-UX B4).
+//! wrapping, diff-line classification for confirmations, and small display
+//! summaries. Kept free of any rendering/terminal dependency so they're
+//! directly unit-testable (SPEC-UX B4).
 
 /// Word-wraps `text` to `width` columns (at least 1). Existing newlines are
 /// preserved as hard breaks; long words with no spaces are hard-split at
@@ -81,19 +81,15 @@ pub fn diff_lines_for_modal(diff: &str) -> Vec<(DiffLineKind, &str)> {
     diff.lines().map(|l| (classify_diff_line(l), l)).collect()
 }
 
-/// Clamps a scroll offset (lines scrolled up from the bottom) so it never
-/// exceeds the amount of content that can usefully be scrolled past
-/// (SPEC-UX B2: PgUp/PgDn/mouse wheel/auto-scroll math).
-pub fn clamp_scroll(total_lines: usize, viewport_height: usize, requested_offset: usize) -> usize {
-    let max_offset = total_lines.saturating_sub(viewport_height);
-    requested_offset.min(max_offset)
-}
-
-/// Whether the viewport is currently at the bottom (no lines scrolled up) --
-/// used to decide whether auto-scroll should keep following new content
-/// (SPEC-UX B2).
-pub fn is_at_bottom(scroll_offset: usize) -> bool {
-    scroll_offset == 0
+pub fn truncate_summary(text: &str, max_chars: usize) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let max_chars = max_chars.max(1);
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    let mut out: String = normalized.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 #[cfg(test)]
@@ -145,15 +141,8 @@ mod tests {
     }
 
     #[test]
-    fn clamp_scroll_never_exceeds_available_content() {
-        assert_eq!(clamp_scroll(100, 20, 1000), 80);
-        assert_eq!(clamp_scroll(10, 20, 5), 0);
-        assert_eq!(clamp_scroll(100, 20, 30), 30);
-    }
-
-    #[test]
-    fn is_at_bottom_true_only_at_zero_offset() {
-        assert!(is_at_bottom(0));
-        assert!(!is_at_bottom(1));
+    fn truncate_summary_collapses_whitespace_and_adds_ellipsis() {
+        assert_eq!(truncate_summary("one\n two   three", 9), "one two …");
+        assert_eq!(truncate_summary("short", 10), "short");
     }
 }

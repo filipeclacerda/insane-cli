@@ -1,5 +1,5 @@
-//! Fullscreen TUI (SPEC-UX Part B): alternate screen + raw mode via
-//! `crossterm`, rendered with `ratatui`. Entered by `insane`/`insane chat`
+//! Inline TUI (SPEC-UX Part B): raw mode via `crossterm`, rendered with
+//! ratatui's inline viewport. Entered by `insane`/`insane chat`
 //! when stdin *and* stdout are both a TTY and `--plain`/`config ui = "plain"`
 //! weren't requested (`crate::commands::chat::use_tui`).
 //!
@@ -23,21 +23,21 @@ pub mod ui_impl;
 pub mod view;
 
 use std::future::Future;
-use std::io;
+use std::io::{self, Write};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
-    KeyModifiers, MouseEventKind,
+    KeyModifiers,
 };
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
+use ratatui::text::Line;
+use ratatui::widgets::{Paragraph, Widget};
+use ratatui::{Terminal, TerminalOptions, Viewport};
 
 use crate::agent::{self, TurnOutcome};
 use crate::client::LlmClient;
@@ -50,10 +50,11 @@ use crate::tools::{
 use crate::ui::Decision;
 use crate::AppContext;
 
-use app::{AppState, InteractionMode, PendingSessionPicker};
+use app::{AppState, InteractionMode, MsgBlock, PendingSessionPicker};
 use ui_impl::TuiUi;
 
 type Term = Terminal<CrosstermBackend<io::Stdout>>;
+const INLINE_INITIAL_HEIGHT: u16 = 6;
 
 static LOG_SINK: OnceLock<Mutex<Option<Arc<Mutex<AppState>>>>> = OnceLock::new();
 
@@ -97,24 +98,21 @@ pub(crate) fn capture_log_line(line: String) -> bool {
 struct TerminalGuard;
 
 impl TerminalGuard {
-    fn enter() -> io::Result<Term> {
+    fn enter(height: u16) -> io::Result<Term> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        crossterm::execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
-        Terminal::new(CrosstermBackend::new(stdout))
+        crossterm::execute!(stdout, EnableBracketedPaste)?;
+        inline_terminal(height)
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
-        let _ = crossterm::execute!(
-            stdout,
-            DisableBracketedPaste,
-            LeaveAlternateScreen,
-            crossterm::cursor::Show,
-        );
+        let _ = crossterm::execute!(stdout, DisableBracketedPaste, crossterm::cursor::Show);
         let _ = disable_raw_mode();
+        let _ = write!(stdout, "\r\n");
+        let _ = stdout.flush();
     }
 }
 
@@ -125,17 +123,23 @@ fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let mut stdout = io::stdout();
-        let _ = crossterm::execute!(
-            stdout,
-            DisableBracketedPaste,
-            LeaveAlternateScreen,
-            crossterm::cursor::Show,
-        );
+        let _ = crossterm::execute!(stdout, DisableBracketedPaste, crossterm::cursor::Show);
         let _ = disable_raw_mode();
+        let _ = write!(stdout, "\r\n");
+        let _ = stdout.flush();
         let redacted = crate::secrets::redact(&crate::error::redact(&info.to_string()));
         eprintln!("{redacted}");
         default_hook(info);
     }));
+}
+
+fn inline_terminal(height: u16) -> io::Result<Term> {
+    Terminal::with_options(
+        CrosstermBackend::new(io::stdout()),
+        TerminalOptions {
+            viewport: Viewport::Inline(height.max(1)),
+        },
+    )
 }
 
 type TurnFuture<'a> = Pin<Box<dyn Future<Output = Result<TurnOutcome, ApiError>> + Send + 'a>>;
@@ -149,12 +153,20 @@ pub async fn run(
     continue_last: bool,
 ) -> Result<(), ApiError> {
     install_panic_hook();
-    let mut terminal = TerminalGuard::enter()
+    let mut inline_height = INLINE_INITIAL_HEIGHT;
+    let mut terminal = TerminalGuard::enter(inline_height)
         .map_err(|e| ApiError::permanent(format!("failed to start TUI: {e}")))?;
     let _guard = TerminalGuard;
 
     let mut local_ctx = ctx.clone();
-    let result = run_app(&mut local_ctx, tools_enabled, continue_last, &mut terminal).await;
+    let result = run_app(
+        &mut local_ctx,
+        tools_enabled,
+        continue_last,
+        &mut terminal,
+        &mut inline_height,
+    )
+    .await;
     result
 }
 
@@ -163,6 +175,7 @@ async fn run_app(
     tools_enabled: bool,
     continue_last: bool,
     terminal: &mut Term,
+    inline_height: &mut u16,
 ) -> Result<(), ApiError> {
     let model = crate::commands::chat::initial_model(ctx);
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -214,11 +227,11 @@ async fn run_app(
         st.provider = ctx.cfg.active_provider.clone();
         st.providers = ctx.cfg.providers.keys().cloned().collect();
         st.push_warn(if tools_enabled {
-            "insane-cli TUI (tools enabled) -- Enter=send, Ctrl+C=cancel/exit, Ctrl+L=clear, \
+            "insane-cli TUI (tools enabled) -- Enter=send, Esc/Ctrl+C=cancel, Ctrl+L=clear, \
 Ctrl+O=toggle thinking, /help"
                 .to_string()
         } else {
-            "insane-cli TUI -- Enter=send, Ctrl+C=cancel/exit, Ctrl+L=clear, Ctrl+O=toggle thinking, \
+            "insane-cli TUI -- Enter=send, Esc/Ctrl+C=cancel, Ctrl+L=clear, Ctrl+O=toggle thinking, \
 /help"
                 .to_string()
         });
@@ -265,7 +278,7 @@ Ctrl+O=toggle thinking, /help"
     let mut events = EventStream::new();
     let mut render_tick = tokio::time::interval(Duration::from_millis(33));
 
-    render(terminal, &state)?;
+    render(terminal, &state, inline_height)?;
     match ctx.client.list_models().await {
         Ok(models) => {
             state
@@ -339,7 +352,7 @@ Ctrl+O=toggle thinking, /help"
                 }
                 let dirty = state.lock().unwrap().dirty;
                 if dirty {
-                    render(terminal, &state)?;
+                    render(terminal, &state, inline_height)?;
                     state.lock().unwrap().dirty = false;
                 }
             }
@@ -356,6 +369,7 @@ Ctrl+O=toggle thinking, /help"
                 &mut events,
                 &mut render_tick,
                 terminal,
+                inline_height,
                 &mut last_finish_reason,
             )
             .await?;
@@ -387,6 +401,7 @@ async fn run_one_turn(
     events: &mut EventStream,
     render_tick: &mut tokio::time::Interval,
     terminal: &mut Term,
+    inline_height: &mut u16,
     last_finish_reason: &mut Option<String>,
 ) -> Result<(), ApiError> {
     let mode = state.lock().unwrap().mode;
@@ -426,7 +441,7 @@ async fn run_one_turn(
                 refresh_rate_status(ctx, state).await;
                 let dirty = state.lock().unwrap().dirty;
                 if dirty {
-                    render(terminal, state)?;
+                    render(terminal, state, inline_height)?;
                     state.lock().unwrap().dirty = false;
                 }
             }
@@ -434,12 +449,159 @@ async fn run_one_turn(
     }
 }
 
-fn render(terminal: &mut Term, state: &Arc<Mutex<AppState>>) -> Result<(), ApiError> {
+fn render(
+    terminal: &mut Term,
+    state: &Arc<Mutex<AppState>>,
+    inline_height: &mut u16,
+) -> Result<(), ApiError> {
+    let width = terminal
+        .size()
+        .map_err(|e| ApiError::permanent(format!("TUI size failed: {e}")))?
+        .width
+        .max(1) as usize;
+
+    let mut insert_lines = Vec::new();
+    let (desired_height, reset_viewport, purge_terminal) = {
+        let mut st = state.lock().unwrap();
+        drain_committed_blocks(&mut st, width, &mut insert_lines);
+        drain_live_overflow(&mut st, width, &mut insert_lines);
+        if let Some(pending) = st.confirm.as_mut() {
+            if !pending.printed {
+                insert_lines.extend(view::confirm_transcript_lines(pending, width));
+                pending.printed = true;
+            }
+        }
+        let desired_height = view::desired_inline_height(&st, width);
+        let reset_viewport = st.viewport_reset_requested;
+        let purge_terminal = st.terminal_purge_requested;
+        st.viewport_reset_requested = false;
+        st.terminal_purge_requested = false;
+        (desired_height, reset_viewport, purge_terminal)
+    };
+
+    if purge_terminal {
+        let mut stdout = io::stdout();
+        crossterm::execute!(stdout, Clear(ClearType::All), Clear(ClearType::Purge))
+            .map_err(|e| ApiError::permanent(format!("TUI clear failed: {e}")))?;
+    }
+
+    ensure_viewport_height(terminal, inline_height, desired_height, reset_viewport || purge_terminal)
+        .map_err(|e| ApiError::permanent(format!("TUI viewport reset failed: {e}")))?;
+
+    insert_before_lines(terminal, insert_lines)
+        .map_err(|e| ApiError::permanent(format!("TUI transcript insert failed: {e}")))?;
+
     let st = state.lock().unwrap();
     terminal
-        .draw(|frame| view::draw(frame, &st))
+        .draw(|frame| view::draw_inline(frame, &st))
         .map_err(|e| ApiError::permanent(format!("TUI render failed: {e}")))?;
     Ok(())
+}
+
+fn drain_committed_blocks(st: &mut AppState, width: usize, out: &mut Vec<Line<'static>>) {
+    let frontier = st.commit_frontier().min(st.messages.len());
+    if frontier <= st.committed_blocks {
+        return;
+    }
+
+    let start = st.committed_blocks;
+    let live_skip = st.live_committed_chars;
+    for (offset, msg) in st.messages[start..frontier].iter().enumerate() {
+        if offset == 0 && live_skip > 0 {
+            if let MsgBlock::Assistant(text) = msg {
+                if let Some(tail) = text.get(live_skip..) {
+                    out.extend(view::block_lines(
+                        &MsgBlock::Assistant(tail.to_string()),
+                        width,
+                        st.show_thinking,
+                    ));
+                }
+                continue;
+            }
+        }
+        out.extend(view::block_lines(msg, width, st.show_thinking));
+    }
+    st.committed_blocks = frontier;
+    st.live_committed_chars = 0;
+}
+
+fn drain_live_overflow(st: &mut AppState, width: usize, out: &mut Vec<Line<'static>>) {
+    if !st.processing || st.committed_blocks >= st.messages.len() {
+        return;
+    }
+    let idx = st.committed_blocks;
+    let text = match &st.messages[idx] {
+        MsgBlock::Assistant(text) => text.clone(),
+        _ => return,
+    };
+    let old_commit = st.live_committed_chars.min(text.len());
+    if !text.is_char_boundary(old_commit) {
+        return;
+    }
+    if view::live_tail_lines(st, width).len() <= view::LIVE_TAIL_BUDGET {
+        return;
+    }
+
+    let Some(tail) = text.get(old_commit..) else {
+        return;
+    };
+    let mut chosen = None;
+    for (rel_idx, ch) in tail.char_indices() {
+        if ch != '\n' {
+            continue;
+        }
+        let candidate = old_commit + rel_idx + 1;
+        chosen = Some(candidate);
+        let mut remaining_lines = view::block_lines(
+            &MsgBlock::Assistant(text[candidate..].to_string()),
+            width,
+            st.show_thinking,
+        )
+        .len();
+        for msg in st.messages.iter().skip(idx + 1) {
+            remaining_lines += view::block_lines(msg, width, st.show_thinking).len();
+        }
+        if remaining_lines <= view::LIVE_TAIL_BUDGET {
+            break;
+        }
+    }
+
+    let Some(new_commit) = chosen else {
+        return;
+    };
+    if new_commit <= old_commit {
+        return;
+    }
+    out.extend(view::block_lines(
+        &MsgBlock::Assistant(text[old_commit..new_commit].to_string()),
+        width,
+        st.show_thinking,
+    ));
+    st.live_committed_chars = new_commit;
+}
+
+fn ensure_viewport_height(
+    terminal: &mut Term,
+    current_height: &mut u16,
+    desired_height: u16,
+    force_reset: bool,
+) -> io::Result<()> {
+    if force_reset || *current_height != desired_height {
+        let _ = terminal.clear();
+        *terminal = inline_terminal(desired_height)?;
+        *current_height = desired_height;
+    }
+    Ok(())
+}
+
+fn insert_before_lines(terminal: &mut Term, lines: Vec<Line<'static>>) -> io::Result<()> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let height = lines.len().min(u16::MAX as usize) as u16;
+    terminal.insert_before(height, move |buf| {
+        Paragraph::new(lines).render(buf.area, buf);
+    })
 }
 
 async fn refresh_rate_status(ctx: &AppContext, state: &Arc<Mutex<AppState>>) {
@@ -696,16 +858,6 @@ fn handle_confirm_key(key: &KeyEvent, state: &Arc<Mutex<AppState>>) -> bool {
                 })
             }
         }
-        KeyCode::PageUp => {
-            pending.scroll = pending.scroll.saturating_sub(10);
-            st.dirty = true;
-            None
-        }
-        KeyCode::PageDown => {
-            pending.scroll = pending.scroll.saturating_add(10);
-            st.dirty = true;
-            None
-        }
         _ => None,
     };
     if let Some(decision) = decision {
@@ -724,24 +876,9 @@ fn handle_confirm_key(key: &KeyEvent, state: &Arc<Mutex<AppState>>) -> bool {
 fn handle_event_while_processing(event: Event, state: &Arc<Mutex<AppState>>) -> bool {
     match event {
         Event::Resize(_, _) => {
-            state.lock().unwrap().dirty = true;
-            false
-        }
-        Event::Mouse(m) => {
-            // Only handle scroll wheel; ignore button clicks so the terminal
-            // can process them natively (e.g. text selection).
-            let mut st = state.lock().unwrap();
-            match m.kind {
-                MouseEventKind::ScrollUp => {
-                    st.scroll = st.scroll.saturating_add(2);
-                    st.dirty = true;
-                }
-                MouseEventKind::ScrollDown => {
-                    st.scroll = st.scroll.saturating_sub(2);
-                    st.dirty = true;
-                }
-                _ => {}
-            }
+            // Inline viewports can desync on resize in some terminals; rebuild
+            // the ratatui terminal on the next render tick.
+            state.lock().unwrap().request_viewport_reset();
             false
         }
         Event::Key(key) => {
@@ -752,9 +889,19 @@ fn handle_event_while_processing(event: Event, state: &Arc<Mutex<AppState>>) -> 
                 state.lock().unwrap().toggle_thinking();
                 return false;
             }
-            if key.modifiers.contains(KeyModifiers::CONTROL)
+            if handle_confirm_key(&key, state) {
+                return false;
+            }
+            let cancel_key = if key.code == KeyCode::Esc {
+                Some("Esc")
+            } else if key.modifiers.contains(KeyModifiers::CONTROL)
                 && (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('d'))
             {
+                Some("^C")
+            } else {
+                None
+            };
+            if let Some(cancel_key) = cancel_key {
                 let mut st = state.lock().unwrap();
                 st.processing = false;
                 st.status.spinner_line = None;
@@ -762,20 +909,8 @@ fn handle_event_while_processing(event: Event, state: &Arc<Mutex<AppState>>) -> 
                 // oneshot receiver with it) -- close the modal too so it
                 // doesn't linger over an idle screen.
                 st.confirm = None;
-                st.push_warn("^C received, cancelling this turn".to_string());
+                st.push_warn(format!("{cancel_key} received, cancelling this turn"));
                 return true;
-            }
-            if handle_confirm_key(&key, state) {
-                return false;
-            }
-            if key.code == KeyCode::PageUp {
-                let mut st = state.lock().unwrap();
-                st.scroll = st.scroll.saturating_add(10);
-                st.dirty = true;
-            } else if key.code == KeyCode::PageDown {
-                let mut st = state.lock().unwrap();
-                st.scroll = st.scroll.saturating_sub(10);
-                st.dirty = true;
             }
             false
         }
@@ -799,37 +934,7 @@ fn handle_event(
 ) -> bool {
     match event {
         Event::Resize(_, _) => {
-            state.lock().unwrap().dirty = true;
-            false
-        }
-        Event::Mouse(m) => {
-            // Only handle scroll wheel; ignore button clicks so the terminal
-            // can process them natively (e.g. text selection).
-            let mut st = state.lock().unwrap();
-            match m.kind {
-                MouseEventKind::ScrollUp => {
-                    if let Some(pending) = st.confirm.as_mut() {
-                        pending.scroll = pending.scroll.saturating_sub(2);
-                    } else if let Some(picker) = st.session_picker.as_mut() {
-                        picker.selected = picker.selected.saturating_sub(1);
-                    } else {
-                        st.scroll = st.scroll.saturating_add(2);
-                    }
-                    st.dirty = true;
-                }
-                MouseEventKind::ScrollDown => {
-                    if let Some(pending) = st.confirm.as_mut() {
-                        pending.scroll = pending.scroll.saturating_add(2);
-                    } else if let Some(picker) = st.session_picker.as_mut() {
-                        picker.selected =
-                            (picker.selected + 1).min(picker.sessions.len().saturating_sub(1));
-                    } else {
-                        st.scroll = st.scroll.saturating_sub(2);
-                    }
-                    st.dirty = true;
-                }
-                _ => {}
-            }
+            state.lock().unwrap().request_viewport_reset();
             false
         }
         Event::Key(key) => handle_key(
@@ -1033,7 +1138,9 @@ fn handle_key(
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('l') {
-        state.lock().unwrap().clear_conversation();
+        let mut st = state.lock().unwrap();
+        st.clear_conversation();
+        st.request_terminal_purge();
         session.clear();
         return false;
     }
@@ -1181,24 +1288,6 @@ fn handle_key(
             }
             false
         }
-        KeyCode::PageUp => {
-            let mut st = state.lock().unwrap();
-            st.scroll = st.scroll.saturating_add(10);
-            st.dirty = true;
-            false
-        }
-        KeyCode::PageDown => {
-            let mut st = state.lock().unwrap();
-            st.scroll = st.scroll.saturating_sub(10);
-            st.dirty = true;
-            false
-        }
-        KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let mut st = state.lock().unwrap();
-            st.scroll = 0;
-            st.dirty = true;
-            false
-        }
         KeyCode::Home => {
             let mut st = state.lock().unwrap();
             let before: String = st.input.chars().take(st.cursor).collect();
@@ -1252,7 +1341,11 @@ fn submit_line(
             }
             ReplCommand::Clear => {
                 session.clear();
-                state.lock().unwrap().clear_conversation();
+                {
+                    let mut st = state.lock().unwrap();
+                    st.clear_conversation();
+                    st.request_terminal_purge();
+                }
                 // Also drop the saved session so a later `--continue`
                 // doesn't resurrect a conversation the user wiped.
                 let _ = crate::session_store::clear(&ctx.cfg.active_provider);
@@ -1374,8 +1467,7 @@ fn submit_line(
                 st.push_warn(HELP_COMMANDS.to_string());
                 st.push_warn(
                     "keys: Enter=send  Alt/Shift+Enter=newline  arrows=edit/navigate  \
-Shift+Tab=cycle mode  PgUp/PgDn=scroll  Ctrl+End=bottom  Ctrl+O=toggle thinking  \
-Ctrl+C=cancel/exit  Ctrl+L=clear"
+Shift+Tab=cycle mode  Ctrl+O=toggle thinking  Esc/Ctrl+C=cancel  Ctrl+L=clear"
                         .to_string(),
                 );
             }
@@ -1541,7 +1633,7 @@ mod tests {
                 command: None,
             },
             responder: tx,
-            scroll: 0,
+            printed: true,
             selected: 0,
         });
         handle_confirm_key(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &state);
@@ -1566,7 +1658,7 @@ mod tests {
                 command: None,
             },
             responder: tx,
-            scroll: 0,
+            printed: true,
             selected: 0,
         });
         handle_confirm_key(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &state);

@@ -32,7 +32,7 @@ impl AgentUi for TuiUi {
             st.confirm = Some(PendingConfirm {
                 req,
                 responder: tx,
-                scroll: 0,
+                printed: false,
                 selected: 0,
             });
             st.dirty = true;
@@ -43,15 +43,16 @@ impl AgentUi for TuiUi {
     fn tool_trace(&self, name: &str, arguments: &str) {
         let summary = crate::tools::tool_call_label(name, arguments);
         let mut st = self.state.lock().unwrap();
-        st.push_tool_running(format!("{name}  {summary}"));
+        st.push_tool_running(tool_call_text(name, &summary));
     }
 
     fn tool_summary(&self, name: &str, arguments: &str, result: &str, elapsed: Duration) {
         let value: serde_json::Value = serde_json::from_str(result).unwrap_or_default();
         let ok = value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
         let line = crate::agent::tool_summary_line(name, arguments, result, elapsed);
+        let summary = crate::tools::tool_call_label(name, arguments);
         let mut st = self.state.lock().unwrap();
-        st.finish_tool(ok, line);
+        st.finish_tool(ok, tool_call_text(name, &summary), line);
     }
 
     fn warn(&self, msg: &str) {
@@ -113,5 +114,13 @@ impl AgentUi for TuiUi {
             total,
         );
         st.push_turn_summary(line);
+    }
+}
+
+fn tool_call_text(name: &str, summary: &str) -> String {
+    if summary.trim().is_empty() {
+        format!("{name}()")
+    } else {
+        format!("{name}({summary})")
     }
 }

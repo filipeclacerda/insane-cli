@@ -20,23 +20,23 @@ pub const PURPLE: Color = Color::Rgb(167, 139, 250);
 pub const THINKING_TEXT: Color = Color::Rgb(71, 85, 105);
 
 pub fn app_bg() -> Style {
-    Style::default().fg(TEXT).bg(BG)
+    Style::default().fg(TEXT)
 }
 
 pub fn panel() -> Style {
-    Style::default().fg(TEXT).bg(BG)
+    Style::default().fg(TEXT)
 }
 
 pub fn muted() -> Style {
-    Style::default().fg(MUTED).bg(BG)
+    Style::default().fg(MUTED)
 }
 
 pub fn subtle() -> Style {
-    Style::default().fg(SUBTLE).bg(BG)
+    Style::default().fg(SUBTLE)
 }
 
 pub fn assistant() -> Style {
-    Style::default().fg(TEXT).bg(BG)
+    Style::default().fg(TEXT)
 }
 
 pub fn assistant_markdown() -> Style {
@@ -44,44 +44,52 @@ pub fn assistant_markdown() -> Style {
 }
 
 pub fn user() -> Style {
-    Style::default()
-        .fg(ACCENT)
-        .bg(BG)
-        .add_modifier(Modifier::BOLD)
+    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+}
+
+pub fn user_prompt() -> Style {
+    Style::default().fg(MUTED)
 }
 
 pub fn warning() -> Style {
-    Style::default().fg(WARNING).bg(BG)
+    Style::default().fg(WARNING)
 }
 
 pub fn highlight() -> Style {
-    Style::default()
-        .fg(HIGHLIGHT)
-        .bg(BG)
-        .add_modifier(Modifier::BOLD)
+    Style::default().fg(HIGHLIGHT).add_modifier(Modifier::BOLD)
 }
 
 pub fn thinking() -> Style {
-    Style::default().fg(THINKING_TEXT).bg(BG)
+    Style::default().fg(THINKING_TEXT)
 }
 
 pub fn thinking_label() -> Style {
-    Style::default()
-        .fg(WARNING)
-        .bg(BG)
-        .add_modifier(Modifier::BOLD)
+    Style::default().fg(WARNING).add_modifier(Modifier::BOLD)
 }
 
 pub fn success() -> Style {
-    Style::default().fg(SUCCESS).bg(BG)
+    Style::default().fg(SUCCESS)
 }
 
 pub fn danger() -> Style {
-    Style::default().fg(DANGER).bg(BG)
+    Style::default().fg(DANGER)
 }
 
 pub fn tool_running() -> Style {
-    Style::default().fg(PURPLE).bg(BG)
+    Style::default().fg(PURPLE)
+}
+
+pub fn bullet(status: super::app::ToolStatus) -> Style {
+    match status {
+        super::app::ToolStatus::Running => tool_running(),
+        super::app::ToolStatus::Success => success(),
+        super::app::ToolStatus::Failed => danger(),
+    }
+    .add_modifier(Modifier::BOLD)
+}
+
+pub fn tool_result() -> Style {
+    muted()
 }
 
 pub fn selected() -> Style {
@@ -92,31 +100,25 @@ pub fn selected() -> Style {
 }
 
 pub fn brand() -> Style {
-    Style::default()
-        .fg(Color::Black)
-        .bg(ACCENT)
-        .add_modifier(Modifier::BOLD)
+    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
 }
 
 pub fn header() -> Style {
-    Style::default().fg(TEXT).bg(SURFACE)
+    Style::default().fg(TEXT)
 }
 
 pub fn header_dim() -> Style {
-    Style::default().fg(MUTED).bg(SURFACE)
+    Style::default().fg(MUTED)
 }
 
 pub fn mode(mode: InteractionMode) -> Style {
-    let bg = match mode {
-        InteractionMode::Default => Color::Rgb(71, 85, 105),
-        InteractionMode::Plan => Color::Rgb(180, 83, 9),
-        InteractionMode::Auto => Color::Rgb(22, 101, 52),
-        InteractionMode::AcceptEdits => Color::Rgb(30, 64, 175),
+    let fg = match mode {
+        InteractionMode::Default => MUTED,
+        InteractionMode::Plan => WARNING,
+        InteractionMode::Auto => SUCCESS,
+        InteractionMode::AcceptEdits => ACCENT,
     };
-    Style::default()
-        .fg(Color::White)
-        .bg(bg)
-        .add_modifier(Modifier::BOLD)
+    Style::default().fg(fg).add_modifier(Modifier::BOLD)
 }
 
 pub fn mode_text(mode: InteractionMode) -> Style {
@@ -124,7 +126,7 @@ pub fn mode_text(mode: InteractionMode) -> Style {
         InteractionMode::Default => muted(),
         InteractionMode::Plan => warning(),
         InteractionMode::Auto => success(),
-        InteractionMode::AcceptEdits => Style::default().fg(ACCENT).bg(BG),
+        InteractionMode::AcceptEdits => Style::default().fg(ACCENT),
     }
     .add_modifier(Modifier::BOLD)
 }
@@ -132,8 +134,8 @@ pub fn mode_text(mode: InteractionMode) -> Style {
 pub fn block(title: impl Into<String>) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(BORDER).bg(BG))
+        .border_style(Style::default().fg(BORDER))
         .title(title.into())
-        .title_style(Style::default().fg(MUTED).bg(BG))
+        .title_style(Style::default().fg(MUTED))
         .style(panel())
 }
