@@ -58,6 +58,38 @@ pub fn log_info(opts: OutputOptions, msg: &str) {
     }
 }
 
+/// Prints the insane-cli ASCII banner to stderr, occupying the top of the
+/// terminal. Suppressed by `--quiet` and `--json` (the latter must keep
+/// stdout/stderr free of any non-JSON text). Only called from the interactive
+/// `chat` entry point, never from one-shot commands (`ask`, `status`, ...).
+pub fn print_banner(opts: OutputOptions) {
+    if opts.quiet || opts.json {
+        return;
+    }
+    // FIGlet "slant" style, trimmed to keep it compact yet recognizable.
+    let banner = "\
+  ███                                                  
+ ░░░                                                   
+ ████  ████████    █████   ██████   ████████    ██████ 
+░░███ ░░███░░███  ███░░   ░░░░░███ ░░███░░███  ███░░███
+ ░███  ░███ ░███ ░░█████   ███████  ░███ ░███ ░███████ 
+ ░███  ░███ ░███  ░░░░███ ███░░███  ░███ ░███ ░███░░░  
+ █████ ████ █████ ██████ ░░████████ ████ █████░░██████ 
+░░░░░ ░░░░ ░░░░░ ░░░░░░   ░░░░░░░░ ░░░░ ░░░░░  ░░░░░░  
+                                                       
+                                                       
+   
+
+
+
+
+
+
+
+";
+    eprintln!("{banner}");
+}
+
 /// Logs an error message to stderr (never suppressed by `--quiet`). Runs
 /// both the NVIDIA-key redactor (`error::redact`) and the general secret
 /// redactor (`secrets::redact`) so stray tokens/passwords in error text

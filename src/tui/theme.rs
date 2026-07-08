@@ -17,7 +17,7 @@ pub const WARNING: Color = Color::Rgb(250, 204, 21);
 pub const HIGHLIGHT: Color = Color::Rgb(251, 146, 60);
 pub const DANGER: Color = Color::Rgb(248, 113, 113);
 pub const PURPLE: Color = Color::Rgb(167, 139, 250);
-pub const THINKING_TEXT: Color = Color::Rgb(71, 85, 105);
+pub const THINKING_TEXT: Color = Color::Rgb(148, 163, 184);
 
 pub fn app_bg() -> Style {
     Style::default().fg(TEXT)

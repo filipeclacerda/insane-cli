@@ -547,7 +547,7 @@ fn draw_input(frame: &mut Frame, area: Rect, state: &AppState) {
     let title = if state.processing {
         " esc interrupt  ctrl+o thinking "
     } else {
-        " enter send  alt+enter newline "
+        " enter send  shift+tab mode  ctrl+o thinking  alt+enter newline "
     };
     let p = Paragraph::new(display.join("\n"))
         .style(theme::assistant())
@@ -634,7 +634,10 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
         (None, _) => "tok --".to_string(),
     };
     push_status_part(&mut spans, token_text);
-    push_status_part(&mut spans, "ctrl+c exit/cancel  /help".to_string());
+    push_status_part(
+        &mut spans,
+        "shift+tab mode  ctrl+o thinking  ctrl+c exit/cancel  /help".to_string(),
+    );
     frame.render_widget(Paragraph::new(Line::from(spans)).style(theme::muted()), area);
 }
 
@@ -830,6 +833,26 @@ mod tests {
         assert_eq!(line_text(&lines[0]), "thinking: private thought");
         assert_eq!(lines[0].spans[0].style, theme::thinking_label());
         assert_eq!(lines[0].spans[1].style, theme::thinking());
+    }
+
+    #[test]
+    fn draw_inline_renders_live_thinking_text() {
+        let mut state = AppState::new("model".into(), ".".into(), ".".into());
+        state.processing = true;
+        state.messages.push(MsgBlock::Thinking("private thought".into()));
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_inline(frame, &state)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(rendered.contains("thinking: private thought"));
     }
 
     #[test]

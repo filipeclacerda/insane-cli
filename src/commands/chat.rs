@@ -120,6 +120,11 @@ pub async fn run(
     tools_enabled: bool,
     continue_last: bool,
 ) -> Result<(), ApiError> {
+    // Show the ASCII banner at the top of the terminal for the interactive
+    // chat entry point. Printed to stderr (so stdout stays clean for model
+    // output) and before TUI raw mode is entered (the inline viewport would
+    // otherwise scroll it away). Suppressed by `--quiet`/`--json`.
+    output::print_banner(ctx.out);
     if use_tui(ctx) {
         return crate::tui::run(ctx, tools_enabled, continue_last).await;
     }

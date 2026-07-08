@@ -678,6 +678,33 @@ fn is_ctrl_o(key: &KeyEvent) -> bool {
         && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O'))
 }
 
+fn is_shift_tab(key: &KeyEvent) -> bool {
+    key.code == KeyCode::BackTab
+        || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cycle_interaction_mode(
+    ctx: &mut AppContext,
+    state: &Arc<Mutex<AppState>>,
+    session: &mut Session,
+    permissions: &mut Permissions,
+    cwd: &std::path::Path,
+    tools_enabled: bool,
+) {
+    let mode = {
+        let mut st = state.lock().unwrap();
+        st.mode = st.mode.next();
+        let mode = st.mode;
+        st.push_warn(format!("mode: {} — {}", mode.label(), mode_description(mode)));
+        mode
+    };
+    permissions.set_policy(permission_policy(mode));
+    if tools_enabled {
+        sync_agent_prompt(ctx, session, cwd, mode);
+    }
+}
+
 fn sync_agent_prompt(
     ctx: &AppContext,
     session: &mut Session,
@@ -1081,6 +1108,11 @@ fn handle_key(
         return false;
     }
 
+    if is_shift_tab(&key) {
+        cycle_interaction_mode(ctx, state, session, permissions, cwd, tools_enabled);
+        return false;
+    }
+
     match handle_session_picker_key(&key, state) {
         SessionPickerKey::NoPicker => {}
         SessionPickerKey::Consumed => return false,
@@ -1095,27 +1127,6 @@ fn handle_key(
 
     // A confirmation modal, if open, captures all keys.
     if handle_confirm_key(&key, state) {
-        return false;
-    }
-
-    let is_shift_tab = key.code == KeyCode::BackTab
-        || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT));
-    if is_shift_tab {
-        let mode = {
-            let mut st = state.lock().unwrap();
-            st.mode = st.mode.next();
-            let mode = st.mode;
-            st.push_warn(format!(
-                "mode: {} — {}",
-                mode.label(),
-                mode_description(mode)
-            ));
-            mode
-        };
-        permissions.set_policy(permission_policy(mode));
-        if tools_enabled {
-            sync_agent_prompt(ctx, session, cwd, mode);
-        }
         return false;
     }
 
