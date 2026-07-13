@@ -30,6 +30,7 @@ use insane_cli::ui::test_support::FakeUi;
 use insane_cli::ui::PlainUi;
 use insane_cli::AppContext;
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 
 const FAKE_KEY: &str = "nvapi-test-fake-key-000";
 
@@ -55,6 +56,8 @@ fn test_ctx(base_url: &str, limiter: Arc<RateLimiter>) -> AppContext {
         ignore: vec![],
         max_context_bytes: 192 * 1024,
         agent_max_rounds: 20,
+        agent_rate_cooldown_pct: 75,
+        agent_compact_max_tokens: 1024,
         agent_temperature: 0.2,
         lenient_tool_calls: true,
         system_prompt_extra: String::new(),
@@ -210,11 +213,11 @@ async fn fragmented_stream_arguments_are_accumulated_before_execution() {
 }
 
 // ---------------------------------------------------------------------
-// max_rounds no longer interrupts the loop; rate limiting governs pacing.
+// max_rounds limits tool-calling loops; rate limiting governs pacing.
 // ---------------------------------------------------------------------
 
 #[tokio::test]
-async fn low_max_rounds_does_not_interrupt_tool_calling_loop() {
+async fn low_max_rounds_interrupts_tool_calling_loop() {
     let dir = tempfile::tempdir().unwrap();
     const MAX_ROUNDS: u32 = 2;
 
@@ -244,13 +247,13 @@ async fn low_max_rounds_does_not_interrupt_tool_calling_loop() {
     )
     .await;
 
-    let outcome = result.expect("turn should complete even with a low max_rounds setting");
-    assert_eq!(outcome.finish_reason.as_deref(), Some("stop"));
-    assert_eq!(outcome.rounds, 5);
+    let outcome = result.expect("turn should stop cleanly at max_rounds");
+    assert_eq!(outcome.finish_reason.as_deref(), Some("max_rounds"));
+    assert_eq!(outcome.rounds, MAX_ROUNDS);
     assert_eq!(
         server.requests().len(),
-        5,
-        "the loop should keep going until the model stops calling tools"
+        MAX_ROUNDS as usize,
+        "the loop must stop before spending another model request"
     );
 }
 
@@ -670,4 +673,182 @@ async fn run_command_is_refused_on_non_tty_and_never_executes() {
         !marker.exists(),
         "command must never have been executed after being denied"
     );
+}
+
+#[tokio::test]
+async fn compact_session_replaces_history_and_preserves_system_prompt() {
+    let server = MockServer::scripted(vec![ScriptedResponse::Text(
+        "Objetivo: ajustar o agente. Arquivos: src/agent.rs. Próximo passo: testar.".to_string(),
+    )])
+    .await;
+    let ctx = default_ctx(&server.base_url);
+    let mut session = Session::new("mock/agent-model".to_string(), 192 * 1024);
+    session.push_system("system prompt atual".to_string());
+    session.push_user("preciso ajustar max_rounds".to_string());
+    session.push_assistant("vou ler os arquivos".to_string());
+    session.push_user("também compacte a conversa".to_string());
+    session.push_assistant("ok".to_string());
+    session.push_user("mais contexto para passar do mínimo".to_string());
+
+    let stats = insane_cli::commands::chat::compact_session(&ctx, &mut session)
+        .await
+        .expect("compact succeeds")
+        .expect("conversation should be compacted");
+
+    assert_eq!(stats.original_messages, 5);
+    assert_eq!(server.requests().len(), 1);
+    assert_eq!(session.history.len(), 2);
+    assert_eq!(session.history[0].role, "system");
+    assert_eq!(
+        session.history[0].content.as_deref(),
+        Some("system prompt atual")
+    );
+    assert_eq!(session.history[1].role, "user");
+    assert!(session.history[1]
+        .content
+        .as_deref()
+        .unwrap()
+        .contains("[compacted conversation summary]"));
+    assert!(session.history[1]
+        .content
+        .as_deref()
+        .unwrap()
+        .contains("Objetivo"));
+
+    let request = &server.requests()[0];
+    assert_eq!(request["stream"], false);
+    assert!(request.get("tools").is_none());
+    assert_eq!(request["max_tokens"], 1024);
+}
+
+#[tokio::test]
+async fn compact_session_skips_small_conversation_without_network() {
+    let server = MockServer::scripted(vec![ScriptedResponse::Text(
+        "should not be requested".to_string(),
+    )])
+    .await;
+    let ctx = default_ctx(&server.base_url);
+    let mut session = Session::new("mock/agent-model".to_string(), 192 * 1024);
+    session.push_system("system prompt atual".to_string());
+    session.push_user("oi".to_string());
+
+    let stats = insane_cli::commands::chat::compact_session(&ctx, &mut session)
+        .await
+        .expect("small compact check succeeds");
+
+    assert!(stats.is_none());
+    assert!(server.requests().is_empty());
+    assert_eq!(session.history.len(), 2);
+    assert_eq!(session.history[1].content.as_deref(), Some("oi"));
+}
+
+#[tokio::test]
+async fn cancellation_during_tool_stops_turn_before_next_round_and_replies_to_every_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = vec![
+        ScriptedCall::new(
+            "call_slow",
+            "run_command",
+            &json!({"command": "sleep 10", "timeout_secs": 30}).to_string(),
+        ),
+        ScriptedCall::new("call_pending", "list_files", "{}"),
+    ];
+    let server = MockServer::scripted(vec![ScriptedResponse::ToolCalls(calls)]).await;
+    let ctx = default_ctx(&server.base_url);
+    let mut session = new_session();
+    let mut permissions = Permissions::new();
+    permissions.set_policy(insane_cli::tools::permission::ApprovalPolicy::Auto);
+    let cancellation = CancellationToken::new();
+    let cancel_soon = cancellation.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        cancel_soon.cancel();
+    });
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        agent::run_turn_with_cancel(
+            &ctx,
+            &mut session,
+            &mut permissions,
+            dir.path(),
+            20,
+            &FakeUi::deny(),
+            cancellation,
+        ),
+    )
+    .await
+    .expect("cancelled turn returns promptly")
+    .expect("turn succeeds structurally");
+
+    assert_eq!(outcome.finish_reason.as_deref(), Some("cancelled"));
+    assert_eq!(server.requests().len(), 1, "must not start another round");
+    let replies: Vec<_> = session
+        .history
+        .iter()
+        .filter(|m| m.role == "tool")
+        .collect();
+    assert_eq!(replies.len(), 2, "every assistant tool call has a reply");
+    for reply in replies {
+        let value: serde_json::Value =
+            serde_json::from_str(reply.content.as_deref().unwrap()).unwrap();
+        assert_eq!(value["ok"], false);
+        assert!(value["error"].as_str().unwrap().contains("cancelled"));
+    }
+}
+
+#[tokio::test]
+async fn legacy_run_turn_uses_a_fresh_uncancelled_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = MockServer::scripted(vec![ScriptedResponse::Text("done".to_string())]).await;
+    let ctx = default_ctx(&server.base_url);
+    let mut session = new_session();
+    let mut permissions = Permissions::new();
+    let outcome = agent::run_turn(
+        &ctx,
+        &mut session,
+        &mut permissions,
+        dir.path(),
+        20,
+        &FakeUi::deny(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.finish_reason.as_deref(), Some("stop"));
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn cancellation_during_rate_cooldown_returns_without_requesting_model() {
+    let server =
+        MockServer::scripted(vec![ScriptedResponse::Text("must not run".to_string())]).await;
+    let limiter = Arc::new(RateLimiter::new(1, Duration::from_secs(10)));
+    limiter.acquire().await;
+    let ctx = test_ctx(&server.base_url, limiter);
+    let mut session = new_session();
+    let mut permissions = Permissions::new();
+    let cancellation = CancellationToken::new();
+    let cancel_soon = cancellation.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel_soon.cancel();
+    });
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        agent::run_turn_with_cancel(
+            &ctx,
+            &mut session,
+            &mut permissions,
+            std::path::Path::new("."),
+            20,
+            &FakeUi::deny(),
+            cancellation,
+        ),
+    )
+    .await
+    .expect("cooldown wait is cancellable")
+    .unwrap();
+    assert_eq!(outcome.finish_reason.as_deref(), Some("cancelled"));
+    assert!(server.requests().is_empty());
 }

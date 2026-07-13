@@ -8,9 +8,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{BorderType, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::app::{AppState, MsgBlock, PendingConfirm, PendingSessionPicker, ToolStatus};
+use super::app::{
+    AppState, MsgBlock, PendingConfirm, PendingSessionPicker, ToolOutputLine, ToolStatus,
+};
 use super::format::{diff_lines_for_modal, truncate_summary, wrap_text, DiffLineKind};
 use super::theme;
+use crate::ui::CommandStream;
 
 const MAX_INPUT_LINES: u16 = 5;
 const MIN_INLINE_HEIGHT: u16 = 6;
@@ -100,18 +103,12 @@ pub(crate) fn desired_inline_height(state: &AppState, width: usize) -> u16 {
     } else {
         0
     };
-    let live_height = live_tail_lines(state, width)
-        .len()
-        .min(LIVE_TAIL_BUDGET) as u16;
+    let live_height = live_tail_lines(state, width).len().min(LIVE_TAIL_BUDGET) as u16;
     (live_height + spinner_height + suggestion_height + picker_height + input_lines + 3)
         .clamp(MIN_INLINE_HEIGHT, MAX_INLINE_HEIGHT)
 }
 
-pub(crate) fn block_lines(
-    msg: &MsgBlock,
-    width: usize,
-    show_thinking: bool,
-) -> Vec<Line<'static>> {
+pub(crate) fn block_lines(msg: &MsgBlock, width: usize, show_thinking: bool) -> Vec<Line<'static>> {
     match msg {
         MsgBlock::User(text) => user_lines(text, width),
         MsgBlock::Assistant(text) if text.is_empty() => Vec::new(),
@@ -123,7 +120,18 @@ pub(crate) fn block_lines(
             status,
             call,
             result,
-        } => tool_lines(*status, call, result.as_deref(), width),
+            output,
+            output_truncated,
+            expanded,
+        } => tool_lines(
+            *status,
+            call,
+            result.as_deref(),
+            output,
+            *output_truncated,
+            *expanded,
+            width,
+        ),
         MsgBlock::Warn(text) => wrap_text(&format!("! {text}"), width)
             .into_iter()
             .map(|l| Line::from(Span::styled(l, theme::warning())))
@@ -137,7 +145,12 @@ pub(crate) fn block_lines(
 
 pub(crate) fn live_tail_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    for (idx, msg) in state.messages.iter().enumerate().skip(state.committed_blocks) {
+    for (idx, msg) in state
+        .messages
+        .iter()
+        .enumerate()
+        .skip(state.committed_blocks)
+    {
         if idx == state.committed_blocks && state.live_committed_chars > 0 {
             if let MsgBlock::Assistant(text) = msg {
                 if let Some(tail) = text.get(state.live_committed_chars..) {
@@ -223,7 +236,10 @@ fn assistant_lines(text: &str, width: usize) -> Vec<Line<'static>> {
         if raw_line.chars().next().is_some_and(|c| c.is_whitespace()) {
             lines.extend(wrap_preserving_spaces(raw_line, theme::assistant(), width));
         } else {
-            lines.extend(wrap_styled_segments(parse_assistant_markup(raw_line), width));
+            lines.extend(wrap_styled_segments(
+                parse_assistant_markup(raw_line),
+                width,
+            ));
         }
     }
     lines
@@ -263,6 +279,9 @@ fn tool_lines(
     status: ToolStatus,
     call: &str,
     result: Option<&str>,
+    output: &[ToolOutputLine],
+    output_truncated: bool,
+    expanded: bool,
     width: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
@@ -279,6 +298,34 @@ fn tool_lines(
                 Span::styled(wrapped, theme::assistant()),
             ]));
         }
+    }
+    if expanded {
+        if output_truncated {
+            lines.push(Line::from(Span::styled(
+                "  ⎿  … earlier command output truncated",
+                theme::muted(),
+            )));
+        }
+        for ToolOutputLine { stream, text } in output {
+            let (prefix, style) = match stream {
+                CommandStream::Stdout => ("  │  ", theme::tool_result()),
+                CommandStream::Stderr => ("  !  ", theme::danger()),
+            };
+            for (idx, wrapped) in wrap_text(text, width.saturating_sub(prefix.len()).max(1))
+                .into_iter()
+                .enumerate()
+            {
+                lines.push(Line::from(vec![
+                    Span::styled(if idx == 0 { prefix } else { "     " }, style),
+                    Span::styled(wrapped, style),
+                ]));
+            }
+        }
+    } else if !output.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  ⎿  command output hidden (Ctrl+E)",
+            theme::muted(),
+        )));
     }
     if let Some(result) = result {
         let summary = truncate_summary(result, width.saturating_sub(5).max(1));
@@ -636,9 +683,12 @@ fn draw_status(frame: &mut Frame, area: Rect, state: &AppState) {
     push_status_part(&mut spans, token_text);
     push_status_part(
         &mut spans,
-        "shift+tab mode  ctrl+o thinking  ctrl+c exit/cancel  /help".to_string(),
+        "shift+tab mode  ctrl+o thinking  ctrl+e output  ctrl+c exit/cancel  /help".to_string(),
     );
-    frame.render_widget(Paragraph::new(Line::from(spans)).style(theme::muted()), area);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(theme::muted()),
+        area,
+    );
 }
 
 fn push_status_part(spans: &mut Vec<Span<'static>>, text: String) {
@@ -706,9 +756,11 @@ fn draw_session_picker(frame: &mut Frame, area: Rect, picker: &PendingSessionPic
 mod tests {
     use super::{assistant_lines, block_lines, desired_inline_height, draw_inline, input_layout};
     use crate::session_store::SessionSummary;
-    use crate::tui::app::{AppState, MsgBlock, PendingConfirm, PendingSessionPicker, ToolStatus};
+    use crate::tui::app::{
+        AppState, MsgBlock, PendingConfirm, PendingSessionPicker, ToolOutputLine, ToolStatus,
+    };
     use crate::tui::theme;
-    use crate::ui::ConfirmRequest;
+    use crate::ui::{CommandStream, ConfirmRequest};
     use ratatui::backend::TestBackend;
     use ratatui::text::Line;
     use ratatui::Terminal;
@@ -813,12 +865,46 @@ mod tests {
                 status: ToolStatus::Success,
                 call: "read_file(src/lib.rs)".into(),
                 result: Some("ok in 3ms".into()),
+                output: Vec::new(),
+                output_truncated: false,
+                expanded: false,
             },
             80,
             true,
         );
         assert_eq!(line_text(&tool[0]), "● read_file(src/lib.rs)");
         assert_eq!(line_text(&tool[1]), "  ⎿  ok in 3ms");
+    }
+
+    #[test]
+    fn expanded_command_output_renders_distinct_stdout_and_stderr_lines() {
+        let lines = block_lines(
+            &MsgBlock::Tool {
+                status: ToolStatus::Running,
+                call: "run_command(test)".into(),
+                result: None,
+                output: vec![
+                    ToolOutputLine {
+                        stream: CommandStream::Stdout,
+                        text: "normal".into(),
+                    },
+                    ToolOutputLine {
+                        stream: CommandStream::Stderr,
+                        text: "problem".into(),
+                    },
+                ],
+                output_truncated: true,
+                expanded: true,
+            },
+            80,
+            true,
+        );
+        let rendered: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("earlier command output truncated")));
+        assert!(rendered.iter().any(|line| line == "  │  normal"));
+        assert!(rendered.iter().any(|line| line == "  !  problem"));
     }
 
     #[test]
@@ -839,7 +925,9 @@ mod tests {
     fn draw_inline_renders_live_thinking_text() {
         let mut state = AppState::new("model".into(), ".".into(), ".".into());
         state.processing = true;
-        state.messages.push(MsgBlock::Thinking("private thought".into()));
+        state
+            .messages
+            .push(MsgBlock::Thinking("private thought".into()));
 
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).unwrap();

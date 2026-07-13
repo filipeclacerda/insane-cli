@@ -15,11 +15,17 @@
 //! concurrent render loop to starve (identical to today's behavior).
 
 use std::io::{IsTerminal, Write as _};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use crate::client::Usage;
 use crate::output::OutputOptions;
+use tokio::io::{AsyncBufReadExt, BufReader, Lines};
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 /// The user's answer to a `y`/`n`/`a` confirmation prompt (SPEC-AGENT §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +35,14 @@ pub enum Decision {
     /// "Always allow this tool (or this exact command) for the rest of the
     /// session."
     Always,
+    Cancelled,
+}
+
+/// Origin of a streamed command-output chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandStream {
+    Stdout,
+    Stderr,
 }
 
 /// What is shown to the user for one confirmation (SPEC-UX B3): a
@@ -56,7 +70,11 @@ pub struct ConfirmRequest {
 #[async_trait::async_trait]
 pub trait AgentUi: Send + Sync {
     /// Blocks (cooperatively) until the user answers a confirmation.
-    async fn confirm(&self, req: ConfirmRequest) -> Decision;
+    async fn confirm_with_cancel(
+        &self,
+        req: ConfirmRequest,
+        cancellation: &CancellationToken,
+    ) -> Decision;
     /// A tool is about to run: `→ name(args)`.
     fn tool_trace(&self, name: &str, arguments: &str);
     /// A tool finished: `✓/✗ name label (detail)`.
@@ -67,6 +85,11 @@ pub trait AgentUi: Send + Sync {
     fn stream_text(&self, chunk: &str);
     /// One chunk of provider-supplied reasoning/thinking text.
     fn stream_thinking(&self, _chunk: &str) {}
+    /// One redacted chunk from a running command. Output stays off model stdout.
+    fn command_output(&self, _stream: CommandStream, _chunk: &str) {}
+    /// Clears a pending confirmation, resolving it as `No` when the surface
+    /// has a modal. Default is deliberately a no-op for non-interactive UIs.
+    fn cancel_pending_confirmation(&self) {}
     /// Removes the just-streamed assistant text for a tool-calling round when
     /// it was only a low-value preamble ("vou ler alguns arquivos...").
     /// Plain terminals cannot reliably erase already-printed output, so the
@@ -98,22 +121,77 @@ pub trait AgentUi: Send + Sync {
 
 /// Reads one `y`/`n`/`a` line from stdin, refusing (never destructive) if
 /// stdin isn't a terminal or fails to read.
-fn ask_yna(prompt: &str) -> Decision {
-    eprint!("{prompt} [y/n/a] ");
-    let _ = std::io::stderr().flush();
-
-    if !std::io::stdin().is_terminal() {
-        return Decision::No;
-    }
-
-    let mut line = String::new();
-    if std::io::stdin().read_line(&mut line).is_err() {
-        return Decision::No;
-    }
+fn parse_yna(line: &str) -> Decision {
     match line.trim().to_ascii_lowercase().as_str() {
         "y" | "yes" => Decision::Yes,
         "a" | "always" => Decision::Always,
         _ => Decision::No,
+    }
+}
+
+#[async_trait::async_trait]
+trait AsyncLineSource: Send {
+    async fn next_line(&mut self) -> std::io::Result<Option<String>>;
+}
+
+struct StdinLines(Lines<BufReader<tokio::io::Stdin>>);
+
+#[async_trait::async_trait]
+impl AsyncLineSource for StdinLines {
+    async fn next_line(&mut self) -> std::io::Result<Option<String>> {
+        self.0.next_line().await
+    }
+}
+
+#[derive(Clone)]
+pub struct PlainInput {
+    source: Arc<Mutex<Box<dyn AsyncLineSource>>>,
+    interactive: bool,
+}
+
+impl PlainInput {
+    pub fn stdin() -> Self {
+        Self {
+            source: Arc::new(Mutex::new(Box::new(StdinLines(
+                BufReader::new(tokio::io::stdin()).lines(),
+            )))),
+            interactive: std::io::stdin().is_terminal(),
+        }
+    }
+
+    pub async fn next_line(&self) -> std::io::Result<Option<String>> {
+        self.source.lock().await.next_line().await
+    }
+
+    #[cfg(test)]
+    fn test_channel() -> Self {
+        struct PendingSource;
+        #[async_trait::async_trait]
+        impl AsyncLineSource for PendingSource {
+            async fn next_line(&mut self) -> std::io::Result<Option<String>> {
+                std::future::pending().await
+            }
+        }
+        Self {
+            source: Arc::new(Mutex::new(Box::new(PendingSource))),
+            interactive: true,
+        }
+    }
+}
+
+async fn ask_yna(input: &PlainInput, prompt: &str, cancellation: &CancellationToken) -> Decision {
+    eprint!("{prompt} [y/n/a] ");
+    let _ = std::io::stderr().flush();
+
+    if !input.interactive {
+        return Decision::No;
+    }
+    tokio::select! {
+        _ = cancellation.cancelled() => Decision::Cancelled,
+        line = input.next_line() => match line {
+            Ok(Some(line)) => parse_yna(&line),
+            _ => Decision::No,
+        },
     }
 }
 
@@ -144,13 +222,19 @@ pub fn print_diff_colored(diff: &str) {
 pub struct PlainUi {
     pub out: OutputOptions,
     total_tokens: AtomicU64,
+    input: PlainInput,
 }
 
 impl PlainUi {
     pub fn new(out: OutputOptions) -> Self {
+        Self::with_input(out, PlainInput::stdin())
+    }
+
+    pub fn with_input(out: OutputOptions, input: PlainInput) -> Self {
         PlainUi {
             out,
             total_tokens: AtomicU64::new(0),
+            input,
         }
     }
 
@@ -185,14 +269,18 @@ impl Default for PlainUi {
 
 #[async_trait::async_trait]
 impl AgentUi for PlainUi {
-    async fn confirm(&self, req: ConfirmRequest) -> Decision {
+    async fn confirm_with_cancel(
+        &self,
+        req: ConfirmRequest,
+        cancellation: &CancellationToken,
+    ) -> Decision {
         if let Some(details) = &req.details {
             eprintln!("{details}");
         }
         if let Some(diff) = &req.diff {
             print_diff_colored(diff);
         }
-        ask_yna(&req.prompt)
+        ask_yna(&self.input, &req.prompt, cancellation).await
     }
 
     fn tool_trace(&self, name: &str, arguments: &str) {
@@ -227,6 +315,17 @@ impl AgentUi for PlainUi {
     }
 
     fn stream_thinking(&self, _chunk: &str) {}
+
+    fn command_output(&self, stream: CommandStream, chunk: &str) {
+        if self.out.quiet {
+            return;
+        }
+        if matches!(stream, CommandStream::Stderr) {
+            eprint!("[stderr] ");
+        }
+        eprint!("{chunk}");
+        let _ = std::io::stderr().flush();
+    }
 
     fn end_of_stream(&self) {
         if self.out.json {
@@ -284,7 +383,83 @@ impl AgentUi for PlainUi {
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_support {
-    use super::{AgentUi, ConfirmRequest, Decision, Duration, Usage};
+    use std::sync::Mutex;
+
+    use super::{
+        AgentUi, CancellationToken, CommandStream, ConfirmRequest, Decision, Duration, Usage,
+    };
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum UiEvent {
+        CommandOutput {
+            stream: CommandStream,
+            chunk: String,
+        },
+    }
+
+    /// Thread-safe event recorder for streaming UI tests.
+    pub struct RecordingUi {
+        events: Mutex<Vec<UiEvent>>,
+    }
+
+    impl Default for RecordingUi {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl RecordingUi {
+        pub fn new() -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub fn events(&self) -> Vec<UiEvent> {
+            self.events.lock().unwrap().clone()
+        }
+
+        pub fn command_output_text(&self) -> String {
+            self.events()
+                .into_iter()
+                .map(|event| match event {
+                    UiEvent::CommandOutput { chunk, .. } => chunk,
+                })
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentUi for RecordingUi {
+        async fn confirm_with_cancel(
+            &self,
+            _req: ConfirmRequest,
+            _cancellation: &CancellationToken,
+        ) -> Decision {
+            Decision::No
+        }
+        fn tool_trace(&self, _name: &str, _arguments: &str) {}
+        fn tool_summary(&self, _name: &str, _arguments: &str, _result: &str, _elapsed: Duration) {}
+        fn warn(&self, _msg: &str) {}
+        fn stream_text(&self, _chunk: &str) {}
+        fn command_output(&self, stream: CommandStream, chunk: &str) {
+            self.events.lock().unwrap().push(UiEvent::CommandOutput {
+                stream,
+                chunk: chunk.to_string(),
+            });
+        }
+        fn end_of_stream(&self) {}
+        fn spinner_tick(&self, _line: &str) {}
+        fn clear_status(&self) {}
+        fn turn_summary(
+            &self,
+            _rounds: u32,
+            _tools_executed: u32,
+            _usage: Option<&Usage>,
+            _elapsed: Duration,
+        ) {
+        }
+    }
 
     /// A test double for [`AgentUi`] that answers every confirmation with a
     /// fixed [`Decision`] (default [`Decision::No`]) and otherwise no-ops.
@@ -310,11 +485,20 @@ pub mod test_support {
                 answer: Decision::Always,
             }
         }
+        pub fn cancelled() -> Self {
+            FakeUi {
+                answer: Decision::Cancelled,
+            }
+        }
     }
 
     #[async_trait::async_trait]
     impl AgentUi for FakeUi {
-        async fn confirm(&self, _req: ConfirmRequest) -> Decision {
+        async fn confirm_with_cancel(
+            &self,
+            _req: ConfirmRequest,
+            _cancellation: &CancellationToken,
+        ) -> Decision {
             self.answer
         }
         fn tool_trace(&self, _name: &str, _arguments: &str) {}
@@ -338,6 +522,38 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn plain_confirmation_can_be_cancelled_while_waiting_for_shared_input() {
+        let input = PlainInput::test_channel();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let ui = PlainUi::with_input(
+            OutputOptions {
+                json: false,
+                quiet: false,
+            },
+            input.clone(),
+        );
+        let confirm = ui.confirm_with_cancel(
+            ConfirmRequest {
+                tool: "write_file".into(),
+                prompt: "write?".into(),
+                details: None,
+                diff: None,
+                command: None,
+            },
+            &cancellation,
+        );
+        tokio::pin!(confirm);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut confirm)
+                .await
+                .is_err()
+        );
+        cancellation.cancel();
+        assert_eq!(confirm.await, Decision::Cancelled);
+    }
 
     #[test]
     fn print_diff_colored_does_not_panic_on_empty_diff() {

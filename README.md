@@ -65,7 +65,7 @@ insane ask "onde está o bug?" -f src/main.rs
 insane chat
 # sem nenhum argumento, `insane` sozinho já roda `chat` (com tools)
 insane
-# dentro do chat: /exit  /clear  /model <nome>  /tools  /cwd  /continue  /resume
+# dentro do chat: /exit  /clear  /model <nome>  /tools  /cwd  /continue  /compact  /resume
 # retomar a última sessão salva para o provider ativo (modelo + histórico)
 insane chat --continue
 
@@ -189,6 +189,10 @@ Dentro do chat, os slash commands além dos existentes
   por `max_tokens`), reenvia a conversa com a instrução "Continue exactly
   where you stopped." em vez de fazer você reescrever o pedido. Se a última
   rodada terminou normalmente, avisa que não há nada para continuar.
+- `/compact` — resume a conversa atual em um bloco curto de contexto e
+  substitui o histórico antigo por esse resumo, preservando o system prompt
+  atual. Use quando a conversa já acumulou muitos arquivos, tool outputs ou
+  decisões e você quer reduzir os tokens das próximas rodadas.
 - `/resume` — recarrega a última sessão salva para o provider ativo,
   substituindo a conversa atual. Útil para recuperar um chat fechado em uma
   invocação anterior do `insane`. A sessão é salva automaticamente ao sair
@@ -225,6 +229,10 @@ estruturado da API. Para isso:
 - O system prompt do agente inclui SO/shell, cwd, data, modelo, um snapshot
   do projeto (capado em 150 entradas) e regras explícitas contra "anunciar
   sem agir"; `[agent] system_prompt_extra` no config anexa texto adicional.
+- `[agent] max_rounds` limita quantas rodadas de modelo um único turno pode
+  gastar. `[agent] rate_cooldown_pct` controla apenas o cooldown preventivo
+  antes de outra rodada; os limites reais da API continuam em
+  `rate_limit.rpm` e `rate_limit.min_interval`.
 - `max_tokens` default é 4096; `[agent] temperature` (default 0.2) controla
   a temperatura só do modo agente, com fallback para a `temperature` global
   se essa tiver sido configurada explicitamente.
@@ -325,7 +333,9 @@ Variáveis de ambiente reconhecidas: `NVIDIA_API_KEY`, `LMSTUDIO_API_KEY`,
 `INSANE_PROVIDER`, `INSANE_MODEL`,
 `INSANE_BASE_URL`, `INSANE_TIMEOUT`, `INSANE_MAX_TOKENS`,
 `INSANE_TEMPERATURE`, `INSANE_STREAM`, `INSANE_RPM`,
-`INSANE_MIN_INTERVAL` e `INSANE_LOG`.
+`INSANE_MIN_INTERVAL`, `INSANE_AGENT_MAX_ROUNDS`,
+`INSANE_AGENT_RATE_COOLDOWN_PCT`, `INSANE_AGENT_COMPACT_MAX_TOKENS` e
+`INSANE_LOG`.
 
 `rpm` e `min_interval` são independentes e ambos são respeitados. Por
 exemplo, `rpm = 40` com `min_interval = "1s"` impede mais de 40 requests em

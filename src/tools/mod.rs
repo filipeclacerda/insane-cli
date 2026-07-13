@@ -16,7 +16,9 @@ use std::path::PathBuf;
 use serde_json::json;
 
 use crate::client::ToolDef;
+use crate::ui::AgentUi;
 use permission::Permissions;
+use tokio_util::sync::CancellationToken;
 
 /// Per-call context threaded into every tool implementation: the sandbox
 /// root, size caps, extra ignore globs from config, and the session's
@@ -26,6 +28,9 @@ pub struct ToolExecCtx<'a> {
     pub max_context_bytes: usize,
     pub extra_ignore: &'a [String],
     pub permissions: &'a mut Permissions,
+    pub cancellation: &'a CancellationToken,
+    pub ui: &'a dyn AgentUi,
+    pub turn_id: u64,
 }
 
 /// The full set of tool definitions advertised to the model.
@@ -147,12 +152,21 @@ pub fn plan_tool_defs() -> Vec<ToolDef> {
 /// is captured as an `error` string.
 pub async fn execute(name: &str, arguments: &str, ectx: &mut ToolExecCtx<'_>) -> String {
     let result: Result<String, String> = match name {
-        "list_files" => fs::list_files(arguments, ectx),
+        "list_files" => fs::list_files(arguments, ectx).await,
         "read_file" => fs::read_file(arguments, ectx).await,
         "search_files" => fs::search_files(arguments, ectx).await,
         "write_file" => fs::write_file(arguments, ectx).await,
         "edit_file" => fs::edit_file(arguments, ectx).await,
-        "run_command" => exec::run_command(arguments, &ectx.cwd, ectx.permissions).await,
+        "run_command" => {
+            exec::run_command_with_services(
+                arguments,
+                &ectx.cwd,
+                ectx.permissions,
+                ectx.cancellation,
+                ectx.ui,
+            )
+            .await
+        }
         other => Err(format!("unknown tool: {other}")),
     };
     match result {
@@ -221,6 +235,14 @@ pub fn tool_call_label(name: &str, arguments: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    use crate::ui::{test_support::FakeUi, Decision};
+
+    static TEST_UI: FakeUi = FakeUi {
+        answer: Decision::No,
+    };
+    static TEST_CANCELLATION: OnceLock<CancellationToken> = OnceLock::new();
 
     #[test]
     fn all_tool_defs_has_six_tools_with_unique_names() {
@@ -284,6 +306,9 @@ mod tests {
             max_context_bytes: 192 * 1024,
             extra_ignore,
             permissions: perms,
+            cancellation: TEST_CANCELLATION.get_or_init(CancellationToken::new),
+            ui: &TEST_UI,
+            turn_id: 0,
         }
     }
 
@@ -380,6 +405,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_write_tool_reports_cancelled_differently_from_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let ignore: Vec<String> = vec![];
+        let cancellation = CancellationToken::new();
+        let ui = FakeUi::deny();
+
+        let mut denied_permissions = Permissions::with_ui(Box::new(FakeUi::deny()));
+        let mut denied_ctx = ToolExecCtx {
+            cwd: dir.path().to_path_buf(),
+            max_context_bytes: 1024,
+            extra_ignore: &ignore,
+            permissions: &mut denied_permissions,
+            cancellation: &cancellation,
+            ui: &ui,
+            turn_id: 0,
+        };
+        let denied = execute(
+            "write_file",
+            r#"{"path":"denied.txt","content":"x"}"#,
+            &mut denied_ctx,
+        )
+        .await;
+
+        let mut cancelled_permissions = Permissions::with_ui(Box::new(FakeUi::cancelled()));
+        let mut cancelled_ctx = ToolExecCtx {
+            cwd: dir.path().to_path_buf(),
+            max_context_bytes: 1024,
+            extra_ignore: &ignore,
+            permissions: &mut cancelled_permissions,
+            cancellation: &cancellation,
+            ui: &ui,
+            turn_id: 0,
+        };
+        let cancelled = execute(
+            "write_file",
+            r#"{"path":"cancelled.txt","content":"x"}"#,
+            &mut cancelled_ctx,
+        )
+        .await;
+
+        assert!(denied.contains("user denied write"));
+        assert!(cancelled.contains("cancelled by user"));
+    }
+
+    #[tokio::test]
     async fn list_files_respects_max_entries_cap() {
         let dir = tempfile::tempdir().unwrap();
         for i in 0..10 {
@@ -389,7 +459,7 @@ mod tests {
         let ignore: Vec<String> = vec![];
         let mut c = ctx(dir.path().to_path_buf(), &ignore, &mut perms);
         let args = json!({"max_entries": 3}).to_string();
-        let out = fs::list_files(&args, &mut c).unwrap();
+        let out = fs::list_files(&args, &mut c).await.unwrap();
         assert_eq!(out.lines().count(), 3);
     }
 
@@ -405,7 +475,7 @@ mod tests {
         let mut perms = Permissions::new();
         let ignore: Vec<String> = vec![];
         let mut c = ctx(dir.path().to_path_buf(), &ignore, &mut perms);
-        let out = fs::list_files("{}", &mut c).unwrap();
+        let out = fs::list_files("{}", &mut c).await.unwrap();
         assert!(out.contains("kept.txt"));
         assert!(!out.contains("ignored.txt"));
         assert!(!out.contains(".env"));
@@ -423,6 +493,55 @@ mod tests {
         let args = json!({"pattern": "needle"}).to_string();
         let out = fs::search_files(&args, &mut c).await.unwrap();
         assert!(out.contains("a.txt:2: needle here"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_list_files_returns_structured_cancelled_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let mut permissions = Permissions::with_ui(Box::new(FakeUi::deny()));
+        let ui = FakeUi::deny();
+        let mut ctx = ToolExecCtx {
+            cwd: dir.path().to_path_buf(),
+            max_context_bytes: 1024,
+            extra_ignore: &[],
+            permissions: &mut permissions,
+            cancellation: &cancellation,
+            ui: &ui,
+            turn_id: 0,
+        };
+
+        let result = execute("list_files", "{}", &mut ctx).await;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result).unwrap()["error"],
+            "cancelled by user"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_search_files_returns_structured_cancelled_result() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "needle").unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let mut permissions = Permissions::with_ui(Box::new(FakeUi::deny()));
+        let ui = FakeUi::deny();
+        let mut ctx = ToolExecCtx {
+            cwd: dir.path().to_path_buf(),
+            max_context_bytes: 1024,
+            extra_ignore: &[],
+            permissions: &mut permissions,
+            cancellation: &cancellation,
+            ui: &ui,
+            turn_id: 0,
+        };
+
+        let result = execute("search_files", r#"{"pattern":"needle"}"#, &mut ctx).await;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result).unwrap()["error"],
+            "cancelled by user"
+        );
     }
 
     #[tokio::test]

@@ -42,6 +42,7 @@ Todas operam APENAS dentro do cwd (canonicalizar path; rejeitar escapes por `..`
 
 ```
 loop (máx N rodadas, default 20, config `agent.max_rounds`):
+  se rodadas >= max_rounds: avisar e encerrar o turno com finish_reason="max_rounds"
   resposta = client.chat_stream(messages + tools)     # streaming; texto impresso incremental
   se delta de texto: imprimir chunk a chunk (stdout)
   se finish_reason == "tool_calls":
@@ -55,6 +56,8 @@ Ctrl+C durante o loop: aborta a rodada em voo, descarta tool_calls pendentes, vo
 ```
 
 - Histórico: reutilizar `session.rs` (trim por bytes preserva pares tool_call/tool result íntegros — nunca deixar `tool` órfão de seu assistant/tool_calls; se trim cortaria no meio, remover o par inteiro).
+- `/compact`: resume a conversa com uma chamada não-tool ao modelo atual e substitui o histórico antigo por uma única mensagem de contexto compactado, preservando o system prompt. Config `agent.compact_max_tokens` controla o tamanho máximo do resumo.
+- `agent.rate_cooldown_pct` controla o cooldown preventivo antes de uma nova rodada; `0` desativa. Os limites reais continuam em `rate_limit.rpm` e `rate_limit.min_interval`.
 - System prompt do agente: descreve as tools, o cwd, SO, instrui a editar via tools e a pedir permissão implícita (a UI cuida). Conciso, em inglês.
 
 ## 5. CLI/UX

@@ -53,6 +53,15 @@ pub async fn run(ctx: &AppContext) -> Result<(), ApiError> {
         println!("  timeout_secs: {}", ctx.cfg.timeout_secs);
         println!("  max_tokens: {}", ctx.cfg.max_tokens);
         println!("  temperature: {}", ctx.cfg.temperature);
+        println!("  agent.max_rounds: {}", ctx.cfg.agent_max_rounds);
+        println!(
+            "  agent.rate_cooldown_pct: {}",
+            ctx.cfg.agent_rate_cooldown_pct
+        );
+        println!(
+            "  agent.compact_max_tokens: {}",
+            ctx.cfg.agent_compact_max_tokens
+        );
         println!("  stream: {}", ctx.cfg.stream);
         println!(
             "  rate_limit.rpm: {}",

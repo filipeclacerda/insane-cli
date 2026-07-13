@@ -39,8 +39,16 @@ min_interval = "0s"
 
 [agent]
 # Cap on tool-calling rounds per user turn in `chat`/`ask --tools` before the
-# agent loop stops with a clear error (SPEC-AGENT §4).
+# agent loop stops the turn with finish_reason="max_rounds" (SPEC-AGENT §4).
 max_rounds = 20
+
+# Preventive cooldown before each agent round. The rate limiter remains
+# controlled by provider `rate_limit.rpm`/`min_interval`; this only tells the
+# agent to wait until usage drops to this percent or lower. Set 0 to disable.
+rate_cooldown_pct = 75
+
+# Max completion tokens used by `/compact`.
+compact_max_tokens = 1024
 
 # Generation temperature used only for agent (tool-calling) turns. Defaults
 # to 0.2 for more deterministic tool calling, or to the global `temperature`

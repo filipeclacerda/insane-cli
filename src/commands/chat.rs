@@ -12,16 +12,16 @@
 use std::{io::IsTerminal, time::Instant};
 
 use futures_util::StreamExt;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio_util::sync::CancellationToken;
 
 use crate::agent;
-use crate::client::{ChatRequest, LlmClient, Usage};
+use crate::client::{ChatMessage, ChatRequest, LlmClient, Usage};
 use crate::error::ApiError;
 use crate::output;
 use crate::session::{self, Command as ReplCommand, Session, CONTINUE_MESSAGE};
 use crate::session_store;
 use crate::tools::{self, permission::Permissions};
-use crate::ui::{AgentUi, PlainUi};
+use crate::ui::{AgentUi, PlainInput, PlainUi};
 use crate::AppContext;
 
 /// Whether this invocation should use the fullscreen TUI (SPEC-UX B1):
@@ -97,6 +97,160 @@ pub(crate) fn restore_loaded_session(
     session.trim();
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactStats {
+    pub original_messages: usize,
+    pub summary_chars: usize,
+}
+
+const COMPACT_MIN_MESSAGES: usize = 4;
+
+fn non_system_messages(session: &Session) -> Vec<ChatMessage> {
+    session
+        .history
+        .iter()
+        .filter(|m| m.role != "system")
+        .cloned()
+        .collect()
+}
+
+fn compact_needed(session: &Session, compact_max_tokens: u32) -> bool {
+    let messages = non_system_messages(session);
+    if messages.len() > COMPACT_MIN_MESSAGES {
+        return true;
+    }
+    let approx_bytes: usize = messages
+        .iter()
+        .map(|m| {
+            m.content.as_deref().map(str::len).unwrap_or(0)
+                + m.tool_calls
+                    .as_ref()
+                    .map(|calls| {
+                        calls
+                            .iter()
+                            .map(|c| c.function.name.len() + c.function.arguments.len())
+                            .sum::<usize>()
+                    })
+                    .unwrap_or(0)
+        })
+        .sum();
+    approx_bytes > (compact_max_tokens as usize).saturating_mul(4)
+}
+
+fn truncate_for_compact(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars).collect();
+    out.push_str("\n...[truncated for compaction]");
+    out
+}
+
+fn format_history_for_compaction(session: &Session) -> String {
+    const PER_MESSAGE_CHARS: usize = 4_000;
+    let mut out = String::new();
+    for message in session.history.iter().filter(|m| m.role != "system") {
+        out.push_str("\n--- ");
+        out.push_str(&message.role);
+        out.push_str(" ---\n");
+        if let Some(content) = &message.content {
+            out.push_str(&truncate_for_compact(content, PER_MESSAGE_CHARS));
+            out.push('\n');
+        }
+        if let Some(calls) = &message.tool_calls {
+            for call in calls {
+                out.push_str("tool_call: ");
+                out.push_str(&call.function.name);
+                out.push(' ');
+                out.push_str(&crate::tools::summarize_args(&call.function.arguments));
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+fn compact_prompt(session: &Session) -> Vec<ChatMessage> {
+    let transcript = format_history_for_compaction(session);
+    vec![
+        ChatMessage::text(
+            "system",
+            "You compact coding-agent conversations. Produce a concise, useful state summary for \
+future turns. Preserve the user's goal, important decisions, files read or changed, commands and \
+results that matter, errors, constraints, and next steps. Do not include filler.",
+        ),
+        ChatMessage::text(
+            "user",
+            format!(
+                "Compact this conversation into a short working-context summary. Keep it actionable \
+for a coding agent and omit irrelevant chatter.\n\nConversation:\n{transcript}"
+            ),
+        ),
+    ]
+}
+
+pub async fn compact_session(
+    ctx: &AppContext,
+    session: &mut Session,
+) -> Result<Option<CompactStats>, ApiError> {
+    compact_session_with_cancel(ctx, session, &CancellationToken::new()).await
+}
+
+pub async fn compact_session_with_cancel(
+    ctx: &AppContext,
+    session: &mut Session,
+    cancellation: &CancellationToken,
+) -> Result<Option<CompactStats>, ApiError> {
+    if !compact_needed(session, ctx.cfg.agent_compact_max_tokens) {
+        return Ok(None);
+    }
+
+    let original_messages = non_system_messages(session).len();
+    let req = ChatRequest {
+        model: session.model.clone(),
+        messages: compact_prompt(session),
+        temperature: Some(ctx.cfg.agent_temperature),
+        top_p: None,
+        max_tokens: Some(ctx.cfg.agent_compact_max_tokens),
+        stream: false,
+        stream_options: None,
+        tools: None,
+        tool_choice: None,
+    };
+    let response = tokio::select! {
+        response = ctx.client.chat(req) => response?,
+        _ = cancellation.cancelled() => return Err(ApiError::Cancelled),
+    };
+    let summary = response.content().trim();
+    if summary.is_empty() {
+        return Err(ApiError::permanent(
+            "compact response was empty; conversation was left unchanged",
+        ));
+    }
+
+    let system = session
+        .history
+        .first()
+        .filter(|m| m.role == "system")
+        .cloned();
+    session.history.clear();
+    if let Some(system) = system {
+        session.history.push(system);
+    }
+    let compacted = format!(
+        "[compacted conversation summary]\n{}",
+        truncate_for_compact(summary, (ctx.cfg.agent_compact_max_tokens as usize) * 8)
+    );
+    let summary_chars = compacted.len();
+    session.history.push(ChatMessage::text("user", compacted));
+    session.trim();
+
+    Ok(Some(CompactStats {
+        original_messages,
+        summary_chars,
+    }))
+}
+
 /// Runs one agentic turn, logging any error and returning the turn's
 /// `finish_reason` (SPEC-UX A3) so the caller can offer `/continue`.
 async fn run_agent_turn(
@@ -106,7 +260,27 @@ async fn run_agent_turn(
     cwd: &std::path::Path,
     ui: &dyn AgentUi,
 ) -> Option<String> {
-    match agent::run_turn(ctx, session, permissions, cwd, ctx.cfg.agent_max_rounds, ui).await {
+    let cancellation = CancellationToken::new();
+    let turn = agent::run_turn_with_cancel(
+        ctx,
+        session,
+        permissions,
+        cwd,
+        ctx.cfg.agent_max_rounds,
+        ui,
+        cancellation.clone(),
+    );
+    tokio::pin!(turn);
+    let outcome = tokio::select! {
+        outcome = &mut turn => outcome,
+        _ = tokio::signal::ctrl_c() => {
+            cancellation.cancel();
+            // Exactly one signal listener is installed for this plain turn.
+            // Await the same future so no reader/task is orphaned.
+            turn.await
+        }
+    };
+    match outcome {
         Ok(outcome) => outcome.finish_reason,
         Err(e) => {
             output::log_error(&e.to_string());
@@ -139,8 +313,10 @@ async fn run_plain(
     let model = initial_model(ctx);
     let mut session = Session::new(model.clone(), ctx.cfg.max_context_bytes);
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let ui = PlainUi::new(ctx.out);
-    let mut permissions = Permissions::with_ui(Box::new(PlainUi::new(ctx.out)));
+    let input = PlainInput::stdin();
+    let ui = PlainUi::with_input(ctx.out, input.clone());
+    let mut permissions =
+        Permissions::with_ui(Box::new(PlainUi::with_input(ctx.out, input.clone())));
     // Tracks whether the last turn ended on a non-`stop`/`tool_calls`
     // `finish_reason` (e.g. `length`), so `/continue` has something to do
     // (SPEC-UX A3).
@@ -181,14 +357,11 @@ async fn run_plain(
     };
     let _ = resumed;
 
-    let stdin = tokio::io::stdin();
-    let mut lines = BufReader::new(stdin).lines();
-
     if tools_enabled {
         output::log_info(
             ctx.out,
             "insane-cli chat (tools enabled) -- /exit, /clear, /model <name>, /tools, /cwd, \
-/continue",
+/continue, /compact",
         );
     } else {
         output::log_info(
@@ -204,11 +377,12 @@ async fn run_plain(
             let _ = std::io::stderr().flush();
         }
 
-        let line = match lines
-            .next_line()
-            .await
-            .map_err(|e| ApiError::permanent(format!("failed to read stdin: {e}")))?
-        {
+        let line = match tokio::select! {
+            line = input.next_line() => line.map_err(|e| ApiError::permanent(format!("failed to read stdin: {e}")))?,
+            _ = tokio::signal::ctrl_c() => {
+                return Err(ApiError::Cancelled);
+            }
+        } {
             Some(l) => l,
             None => break, // EOF (e.g. piped input exhausted)
         };
@@ -298,6 +472,34 @@ async fn run_plain(
                         session.push_user(CONTINUE_MESSAGE.to_string());
                         last_finish_reason =
                             run_agent_turn(ctx, &mut session, &mut permissions, &cwd, &ui).await;
+                    }
+                }
+                ReplCommand::Compact => {
+                    output::log_info(ctx.out, "compacting conversation...");
+                    match compact_session(ctx, &mut session).await {
+                        Ok(Some(stats)) => {
+                            ui.reset_token_total();
+                            conversation_tokens_total = 0;
+                            last_finish_reason = None;
+                            output::log_info(
+                                ctx.out,
+                                &format!(
+                                    "compacted {} messages into ~{} chars",
+                                    stats.original_messages, stats.summary_chars
+                                ),
+                            );
+                            session_store::save(
+                                &ctx.cfg.active_provider,
+                                &session.model,
+                                &session.history,
+                            );
+                        }
+                        Ok(None) => {
+                            output::log_info(ctx.out, "nothing to compact");
+                        }
+                        Err(err) => {
+                            output::log_error(&format!("could not compact conversation: {err}"));
+                        }
                     }
                 }
                 ReplCommand::Resume(choice) => {
@@ -407,7 +609,17 @@ async fn run_plain(
         let mut stream = ctx.client.chat_stream(req).await?;
         let mut full = String::new();
         let mut turn_usage: Option<Usage> = None;
-        while let Some(item) = stream.next().await {
+        loop {
+            let item = tokio::select! {
+                item = stream.next() => item,
+                _ = tokio::signal::ctrl_c() => {
+                    output::log_info(ctx.out, "^C received, cancelling this response");
+                    break;
+                }
+            };
+            let Some(item) = item else {
+                break;
+            };
             match item {
                 Ok(chunk) => {
                     output::print_stream_chunk(ctx.out, &chunk.delta);

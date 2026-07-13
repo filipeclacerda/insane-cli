@@ -16,11 +16,18 @@
 //! and that a refusal always leaves the filesystem untouched.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use insane_cli::tools::permission::Permissions;
 use insane_cli::tools::{fs as tool_fs, sandbox, ToolExecCtx};
 use insane_cli::ui::test_support::FakeUi;
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
+
+static TEST_CANCELLATION: OnceLock<CancellationToken> = OnceLock::new();
+static TEST_UI: FakeUi = FakeUi {
+    answer: insane_cli::ui::Decision::No,
+};
 
 fn ctx<'a>(cwd: PathBuf, ignore: &'a [String], perms: &'a mut Permissions) -> ToolExecCtx<'a> {
     ToolExecCtx {
@@ -28,6 +35,9 @@ fn ctx<'a>(cwd: PathBuf, ignore: &'a [String], perms: &'a mut Permissions) -> To
         max_context_bytes: 192 * 1024,
         extra_ignore: ignore,
         permissions: perms,
+        cancellation: TEST_CANCELLATION.get_or_init(CancellationToken::new),
+        ui: &TEST_UI,
+        turn_id: 0,
     }
 }
 
@@ -73,14 +83,14 @@ async fn read_file_rejects_absolute_path_outside_cwd() {
     assert_eq!(std::fs::read_to_string(&outside).unwrap(), "outside secret");
 }
 
-#[test]
-fn list_files_rejects_dotdot_escape() {
+#[tokio::test]
+async fn list_files_rejects_dotdot_escape() {
     let dir = tempfile::tempdir().unwrap();
     let mut perms = deny_perms();
     let ignore: Vec<String> = vec![];
     let mut c = ctx(dir.path().to_path_buf(), &ignore, &mut perms);
     let args = json!({"path": ".."}).to_string();
-    let err = tool_fs::list_files(&args, &mut c).unwrap_err();
+    let err = tool_fs::list_files(&args, &mut c).await.unwrap_err();
     assert!(err.contains("escapes"));
 }
 
@@ -273,8 +283,8 @@ async fn run_command_denied_on_non_tty_never_creates_the_file_it_would_have() {
 // list_files: .gitignore respected, cap enforced.
 // ---------------------------------------------------------------------
 
-#[test]
-fn list_files_respects_hidden_gitignore_and_denylist() {
+#[tokio::test]
+async fn list_files_respects_hidden_gitignore_and_denylist() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join(".gitignore"), "build/\n*.log\n").unwrap();
     std::fs::create_dir(dir.path().join("build")).unwrap();
@@ -287,7 +297,7 @@ fn list_files_respects_hidden_gitignore_and_denylist() {
     let mut perms = deny_perms();
     let ignore: Vec<String> = vec![];
     let mut c = ctx(dir.path().to_path_buf(), &ignore, &mut perms);
-    let out = tool_fs::list_files("{}", &mut c).unwrap();
+    let out = tool_fs::list_files("{}", &mut c).await.unwrap();
     assert!(out.contains("src_main.rs"));
     assert!(!out.contains("artifact.o"));
     assert!(!out.contains("debug.log"));
@@ -295,8 +305,8 @@ fn list_files_respects_hidden_gitignore_and_denylist() {
     assert!(!out.contains("server.pem"));
 }
 
-#[test]
-fn list_files_caps_entries_even_with_many_files() {
+#[tokio::test]
+async fn list_files_caps_entries_even_with_many_files() {
     let dir = tempfile::tempdir().unwrap();
     for i in 0..50 {
         std::fs::write(dir.path().join(format!("file_{i:03}.txt")), "x").unwrap();
@@ -306,7 +316,7 @@ fn list_files_caps_entries_even_with_many_files() {
     let ignore: Vec<String> = vec![];
     let mut c = ctx(dir.path().to_path_buf(), &ignore, &mut perms);
     let args = json!({"max_entries": 10}).to_string();
-    let out = tool_fs::list_files(&args, &mut c).unwrap();
+    let out = tool_fs::list_files(&args, &mut c).await.unwrap();
     assert_eq!(out.lines().count(), 10);
 }
 

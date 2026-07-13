@@ -25,6 +25,8 @@ pub fn parse_command(line: &str) -> Option<Command> {
         Some(Command::Cwd)
     } else if trimmed == "/continue" {
         Some(Command::Continue)
+    } else if trimmed == "/compact" {
+        Some(Command::Compact)
     } else if trimmed == "/resume" {
         Some(Command::Resume(None))
     } else if let Some(rest) = trimmed.strip_prefix("/resume ") {
@@ -71,6 +73,9 @@ pub enum Command {
     /// the model left off (SPEC-UX A3) -- meant for after a `finish_reason
     /// != stop/tool_calls` (e.g. `length`) cut a response short.
     Continue,
+    /// Compacts the current conversation into a short working summary to
+    /// reduce tokens on future turns.
+    Compact,
     /// Copies the last assistant message to the system clipboard.
     Copy,
     /// Reloads the most recently saved session for the active provider,
@@ -84,7 +89,7 @@ pub enum Command {
 /// Text for `/help`: slash commands, shared by line mode and the TUI. The
 /// TUI appends its own keybinding list after this (SPEC-UX B4).
 pub const HELP_COMMANDS: &str =
-    "commands: /provider <name> /providers /model <name> /models /mode <default|plan|accept-edits|auto> /clear /tools /cwd /continue /copy /resume [1-3] /help /exit";
+    "commands: /provider <name> /providers /model <name> /models /mode <default|plan|accept-edits|auto> /clear /tools /cwd /continue /compact /copy /resume [1-3] /help /exit";
 
 /// Metadata used by `/help` and the TUI's live slash-command palette.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +144,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/continue",
         usage: "/continue",
         description: "continuar uma resposta interrompida",
+    },
+    SlashCommand {
+        name: "/compact",
+        usage: "/compact",
+        description: "resumir a conversa para reduzir tokens",
     },
     SlashCommand {
         name: "/resume",
@@ -371,6 +381,7 @@ mod tests {
             parse_command("/continue"),
             Some(Command::Continue)
         ));
+        assert!(matches!(parse_command("/compact"), Some(Command::Compact)));
         assert!(matches!(parse_command("/copy"), Some(Command::Copy)));
         assert!(matches!(
             parse_command("/resume"),

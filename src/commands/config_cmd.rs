@@ -150,6 +150,21 @@ fn get_field(file: &FileConfig, key: &str) -> Result<String, ApiError> {
             .map(|v| v.to_string())
             .unwrap_or_default(),
         "rate_limit.min_interval" => file.rate_limit.min_interval.clone().unwrap_or_default(),
+        "agent.max_rounds" => file
+            .agent
+            .max_rounds
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        "agent.rate_cooldown_pct" => file
+            .agent
+            .rate_cooldown_pct
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        "agent.compact_max_tokens" => file
+            .agent
+            .compact_max_tokens
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
         other => {
             if let Some(rest) = other.strip_prefix("providers.") {
                 let (name, field) = rest.split_once('.').ok_or_else(|| ApiError::Usage {
@@ -219,6 +234,33 @@ fn set_field(file: &mut FileConfig, key: &str, value: &str) -> Result<(), ApiErr
         "rate_limit.min_interval" => {
             config::parse_duration(value)?;
             file.rate_limit.min_interval = Some(value.to_string());
+        }
+        "agent.max_rounds" => {
+            let max_rounds: u32 = value.parse().map_err(parse_err)?;
+            if max_rounds == 0 {
+                return Err(ApiError::Usage {
+                    message: "agent.max_rounds must be greater than zero".to_string(),
+                });
+            }
+            file.agent.max_rounds = Some(max_rounds);
+        }
+        "agent.rate_cooldown_pct" => {
+            let pct = value.parse().map_err(parse_err)?;
+            if pct > 100 {
+                return Err(ApiError::Usage {
+                    message: "agent.rate_cooldown_pct must be between 0 and 100".to_string(),
+                });
+            }
+            file.agent.rate_cooldown_pct = Some(pct);
+        }
+        "agent.compact_max_tokens" => {
+            let max_tokens = value.parse().map_err(parse_err)?;
+            if max_tokens == 0 {
+                return Err(ApiError::Usage {
+                    message: "agent.compact_max_tokens must be greater than zero".to_string(),
+                });
+            }
+            file.agent.compact_max_tokens = Some(max_tokens);
         }
         other => {
             if let Some(rest) = other.strip_prefix("providers.") {
@@ -298,6 +340,16 @@ mod tests {
         let provider = file.providers.get("local").unwrap();
         assert_eq!(provider.kind, config::ProviderKind::Lmstudio);
         assert_eq!(provider.rate_limit.min_interval.as_deref(), Some("1s"));
+    }
+
+    #[test]
+    fn agent_max_rounds_rejects_zero() {
+        let mut file = FileConfig::default();
+        let err = set_field(&mut file, "agent.max_rounds", "0").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("agent.max_rounds must be greater than zero"));
+        assert!(file.agent.max_rounds.is_none());
     }
 
     #[test]

@@ -39,6 +39,8 @@ use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::agent::{self, TurnOutcome};
 use crate::client::LlmClient;
 use crate::error::ApiError;
@@ -228,11 +230,11 @@ async fn run_app(
         st.providers = ctx.cfg.providers.keys().cloned().collect();
         st.push_warn(if tools_enabled {
             "insane-cli TUI (tools enabled) -- Enter=send, Esc/Ctrl+C=cancel, Ctrl+L=clear, \
-Ctrl+O=toggle thinking, /help"
+Ctrl+O=toggle thinking, Ctrl+E=toggle command output, /help"
                 .to_string()
         } else {
             "insane-cli TUI -- Enter=send, Esc/Ctrl+C=cancel, Ctrl+L=clear, Ctrl+O=toggle thinking, \
-/help"
+Ctrl+E=toggle command output, /help"
                 .to_string()
         });
         // Replay the resumed conversation into the visible transcript so the
@@ -313,6 +315,7 @@ Ctrl+O=toggle thinking, /help"
         // (which is what made the borrow checker reject the `Option<
         // TurnFuture>`-as-a-loop-variable version of this).
         let mut start_turn_now = false;
+        let mut start_compact_now = false;
         tokio::select! {
             biased;
 
@@ -350,6 +353,7 @@ Ctrl+O=toggle thinking, /help"
                         &mut last_finish_reason,
                     );
                 }
+                start_compact_now = take_pending_compact(&state);
                 let dirty = state.lock().unwrap().dirty;
                 if dirty {
                     render(terminal, &state, inline_height)?;
@@ -375,6 +379,19 @@ Ctrl+O=toggle thinking, /help"
             .await?;
             // Persist after each turn so a crash/Ctrl+C mid-chat still
             // leaves something for `--continue` to resume. Best-effort.
+            crate::session_store::save(&ctx.cfg.active_provider, &session.model, &session.history);
+        } else if start_compact_now {
+            run_compact_task(
+                ctx,
+                &mut session,
+                &state,
+                &mut events,
+                &mut render_tick,
+                terminal,
+                inline_height,
+                &mut last_finish_reason,
+            )
+            .await?;
             crate::session_store::save(&ctx.cfg.active_provider, &session.model, &session.history);
         }
     }
@@ -405,7 +422,16 @@ async fn run_one_turn(
     last_finish_reason: &mut Option<String>,
 ) -> Result<(), ApiError> {
     let mode = state.lock().unwrap().mode;
-    let mut turn_fut = start_turn(ctx, session, permissions, cwd, ui, mode);
+    let cancellation = CancellationToken::new();
+    let mut turn_fut = start_turn(
+        ctx,
+        session,
+        permissions,
+        cwd,
+        ui,
+        mode,
+        cancellation.clone(),
+    );
 
     loop {
         tokio::select! {
@@ -427,12 +453,93 @@ async fn run_one_turn(
                 match maybe_event {
                     Some(Ok(event)) => {
                         if handle_event_while_processing(event, state) {
-                            return Ok(()); // dropping `turn_fut` cancels the round in flight
+                            cancellation.cancel();
                         }
                     }
                     Some(Err(_)) | None => {
                         state.lock().unwrap().should_quit = true;
                         return Ok(());
+                    }
+                }
+            }
+
+            _ = render_tick.tick() => {
+                refresh_rate_status(ctx, state).await;
+                let dirty = state.lock().unwrap().dirty;
+                if dirty {
+                    render(terminal, state, inline_height)?;
+                    state.lock().unwrap().dirty = false;
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_compact_task(
+    ctx: &AppContext,
+    session: &mut Session,
+    state: &Arc<Mutex<AppState>>,
+    events: &mut EventStream,
+    render_tick: &mut tokio::time::Interval,
+    terminal: &mut Term,
+    inline_height: &mut u16,
+    last_finish_reason: &mut Option<String>,
+) -> Result<(), ApiError> {
+    {
+        let mut st = state.lock().unwrap();
+        st.processing = true;
+        st.status.spinner_line = Some("compacting conversation...".to_string());
+        st.push_warn("compacting conversation...".to_string());
+    }
+
+    let cancellation = CancellationToken::new();
+    let compact_fut =
+        crate::commands::chat::compact_session_with_cancel(ctx, session, &cancellation);
+    tokio::pin!(compact_fut);
+
+    loop {
+        tokio::select! {
+            biased;
+
+            outcome = &mut compact_fut => {
+                let mut st = state.lock().unwrap();
+                st.processing = false;
+                st.status.spinner_line = None;
+                match outcome {
+                    Ok(Some(stats)) => {
+                        st.clear_conversation();
+                        st.push_warn(format!(
+                            "compacted {} messages into ~{} chars",
+                            stats.original_messages, stats.summary_chars
+                        ));
+                        *last_finish_reason = None;
+                    }
+                    Ok(None) => {
+                        st.push_warn("nothing to compact".to_string());
+                    }
+                    Err(ApiError::Cancelled) => {
+                        st.push_warn("compaction cancelled".to_string());
+                    }
+                    Err(err) => {
+                        st.push_warn(format!("could not compact conversation: {err}"));
+                    }
+                }
+                st.dirty = true;
+                return Ok(());
+            }
+
+            maybe_event = events.next() => {
+                match maybe_event {
+                    Some(Ok(event)) => {
+                        if handle_event_while_processing(event, state) {
+                            cancellation.cancel();
+                        }
+                    }
+                    Some(Err(_)) | None => {
+                        let mut st = state.lock().unwrap();
+                        st.should_quit = true;
+                        cancellation.cancel();
                     }
                 }
             }
@@ -485,8 +592,13 @@ fn render(
             .map_err(|e| ApiError::permanent(format!("TUI clear failed: {e}")))?;
     }
 
-    ensure_viewport_height(terminal, inline_height, desired_height, reset_viewport || purge_terminal)
-        .map_err(|e| ApiError::permanent(format!("TUI viewport reset failed: {e}")))?;
+    ensure_viewport_height(
+        terminal,
+        inline_height,
+        desired_height,
+        reset_viewport || purge_terminal,
+    )
+    .map_err(|e| ApiError::permanent(format!("TUI viewport reset failed: {e}")))?;
 
     insert_before_lines(terminal, insert_lines)
         .map_err(|e| ApiError::permanent(format!("TUI transcript insert failed: {e}")))?;
@@ -632,25 +744,30 @@ fn start_turn<'a>(
     cwd: &'a std::path::Path,
     ui: &'a TuiUi,
     mode: InteractionMode,
+    cancellation: CancellationToken,
 ) -> TurnFuture<'a> {
     if mode == InteractionMode::Plan {
-        Box::pin(agent::run_turn_with_tool_defs(
-            ctx,
-            session,
-            permissions,
-            cwd,
-            ctx.cfg.agent_max_rounds,
-            ui,
-            tools::plan_tool_defs(),
+        Box::pin(agent::run_turn_with_tool_defs_and_cancel(
+            agent::RunTurnArgs {
+                ctx,
+                session,
+                permissions,
+                cwd,
+                max_rounds: ctx.cfg.agent_max_rounds,
+                ui,
+                tool_defs: tools::plan_tool_defs(),
+                cancellation,
+            },
         ))
     } else {
-        Box::pin(agent::run_turn(
+        Box::pin(agent::run_turn_with_cancel(
             ctx,
             session,
             permissions,
             cwd,
             ctx.cfg.agent_max_rounds,
             ui,
+            cancellation,
         ))
     }
 }
@@ -696,7 +813,11 @@ fn cycle_interaction_mode(
         let mut st = state.lock().unwrap();
         st.mode = st.mode.next();
         let mode = st.mode;
-        st.push_warn(format!("mode: {} — {}", mode.label(), mode_description(mode)));
+        st.push_warn(format!(
+            "mode: {} — {}",
+            mode.label(),
+            mode_description(mode)
+        ));
         mode
     };
     permissions.set_policy(permission_policy(mode));
@@ -916,7 +1037,8 @@ fn handle_event_while_processing(event: Event, state: &Arc<Mutex<AppState>>) -> 
                 state.lock().unwrap().toggle_thinking();
                 return false;
             }
-            if handle_confirm_key(&key, state) {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
+                state.lock().unwrap().toggle_latest_command_output();
                 return false;
             }
             let cancel_key = if key.code == KeyCode::Esc {
@@ -932,12 +1054,14 @@ fn handle_event_while_processing(event: Event, state: &Arc<Mutex<AppState>>) -> 
                 let mut st = state.lock().unwrap();
                 st.processing = false;
                 st.status.spinner_line = None;
-                // Cancelling drops the turn future (and the confirm's
-                // oneshot receiver with it) -- close the modal too so it
-                // doesn't linger over an idle screen.
-                st.confirm = None;
+                if let Some(pending) = st.confirm.take() {
+                    let _ = pending.responder.send(Decision::No);
+                }
                 st.push_warn(format!("{cancel_key} received, cancelling this turn"));
                 return true;
+            }
+            if handle_confirm_key(&key, state) {
+                return false;
             }
             false
         }
@@ -986,6 +1110,13 @@ fn handle_event(
 
 fn take_pending_submit(state: &Arc<Mutex<AppState>>) -> Option<String> {
     state.lock().unwrap().pending_submit.take()
+}
+
+fn take_pending_compact(state: &Arc<Mutex<AppState>>) -> bool {
+    let mut st = state.lock().unwrap();
+    let pending = st.pending_compact;
+    st.pending_compact = false;
+    pending
 }
 
 fn restore_pending_submit_as_input(st: &mut AppState) {
@@ -1153,6 +1284,11 @@ fn handle_key(
         st.clear_conversation();
         st.request_terminal_purge();
         session.clear();
+        return false;
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
+        state.lock().unwrap().toggle_latest_command_output();
         return false;
     }
 
@@ -1478,7 +1614,7 @@ fn submit_line(
                 st.push_warn(HELP_COMMANDS.to_string());
                 st.push_warn(
                     "keys: Enter=send  Alt/Shift+Enter=newline  arrows=edit/navigate  \
-Shift+Tab=cycle mode  Ctrl+O=toggle thinking  Esc/Ctrl+C=cancel  Ctrl+L=clear"
+Shift+Tab=cycle mode  Ctrl+O=toggle thinking  Ctrl+E=toggle command output  Esc/Ctrl+C=cancel  Ctrl+L=clear"
                         .to_string(),
                 );
             }
@@ -1569,6 +1705,10 @@ Shift+Tab=cycle mode  Ctrl+O=toggle thinking  Esc/Ctrl+C=cancel  Ctrl+L=clear"
                     st.processing = true;
                     return true;
                 }
+            }
+            ReplCommand::Compact => {
+                state.lock().unwrap().pending_compact = true;
+                return false;
             }
             ReplCommand::Resume(choice) => {
                 if let Some(n) = choice {
@@ -1693,6 +1833,63 @@ mod tests {
 
         assert!(!cancel);
         assert!(!state.lock().unwrap().show_thinking);
+    }
+
+    #[test]
+    fn compact_cancel_event_clears_processing_and_spinner() {
+        let state = Arc::new(Mutex::new(AppState::new(
+            "model".to_string(),
+            ".".to_string(),
+            std::path::PathBuf::from("."),
+        )));
+        {
+            let mut app = state.lock().unwrap();
+            app.processing = true;
+            app.status.spinner_line = Some("compacting conversation...".to_string());
+        }
+
+        let cancel = handle_event_while_processing(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &state,
+        );
+
+        assert!(cancel);
+        let app = state.lock().unwrap();
+        assert!(!app.processing);
+        assert!(app.status.spinner_line.is_none());
+    }
+
+    #[test]
+    fn ctrl_e_toggles_command_output_while_processing() {
+        let state = Arc::new(Mutex::new(AppState::new(
+            "m".into(),
+            ".".into(),
+            ".".into(),
+        )));
+        {
+            let mut app = state.lock().unwrap();
+            app.processing = true;
+            app.push_tool_running("run_command(echo one)".into());
+            app.append_command_output(crate::ui::CommandStream::Stdout, "one\n");
+            assert!(matches!(
+                app.messages.last(),
+                Some(MsgBlock::Tool { expanded: true, .. })
+            ));
+        }
+
+        let cancel = handle_event_while_processing(
+            Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+            &state,
+        );
+
+        assert!(!cancel);
+        assert!(matches!(
+            state.lock().unwrap().messages.last(),
+            Some(MsgBlock::Tool {
+                expanded: false,
+                ..
+            })
+        ));
     }
 
     #[test]

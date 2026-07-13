@@ -23,6 +23,7 @@ O system prompt do agente passa a incluir:
 - Ao fim de cada rodada, se `finish_reason` não for `stop` nem `tool_calls`, exibir aviso claro no stderr: `⚠ response ended early (finish_reason=length) — type /continue to resume`.
 - `finish_reason == "length"` no chat: oferecer continuação — novo slash command `/continue` reenvia com instrução "Continue exactly where you stopped." (sem repetir o texto já emitido).
 - Registrar `finish_reason` no modo `--json`.
+- `finish_reason == "max_rounds"` indica que `agent.max_rounds` interrompeu o turno antes de gastar outra requisição.
 
 ### A4. Fallback para tool call emitida como texto (modelos não-conformes, ex. GLM)
 Alguns modelos emitem a chamada como TEXTO no content em vez de `tool_calls` estruturado. Após uma rodada com `finish_reason=stop` e sem tool_calls, aplicar detecção lenient sobre o content acumulado:
@@ -32,7 +33,7 @@ Alguns modelos emitem a chamada como TEXTO no content em vez de `tool_calls` est
 
 ### A5. Feedback durante o turno (modo linha, pré-TUI)
 - Spinner/status no stderr enquanto aguarda o primeiro token de cada rodada: `⠋ model thinking… (round 2/20)`; apagar a linha quando o texto começar. Detectar TTY; sem TTY, silencioso.
-- Se o rate limiter estiver esperando slot: `⏳ rate limit: waiting 12s (38/40 used)`.
+- Se o rate limiter estiver esperando slot ou cooldown preventivo do agente: `⏳ rate limit: waiting 12s (38/40 used)`.
 - Após cada tool: linha de resumo no stderr: `✓ read_file agent.rs (14.2 KB, 3ms)` / `✗ edit_file … (user denied)` / `✓ run_command "cargo test" (exit 0, 8.4s)`.
 - Ao final do turno: linha discreta com métricas: `— 3 rounds · 2 tools · 1.9k tokens · 14s`.
 - `--quiet` suprime tudo isso.
@@ -75,7 +76,8 @@ Subcomando do clap vira opcional; ausência = `chat` (com tools). `insane --no-t
 - Digitar `@` abre a mesma paleta de sugestões dos slash commands, listando arquivos/dirs do cwd (respeitando `.gitignore`, `config.ignore` e a denylist fixa de chaves/certificados). Caracteres adicionais filtram por prefixo do último segmento do path (ex.: `@READ` casa `README.md`) ou pelo path completo (`@src/app`).
 - ↑/↓ seleciona, Tab/Enter completa **apenas o token `@…`** sob o cursor (não a linha inteira), permitindo menções no meio da mensagem (ex.: `explique @src/lib.rs e @README.md`).
 - Ao enviar, cada `@path` resolvível é expandido inline como bloco fenced (mesmo formato de `ask -f`/`context::format_block`) e uma linha `inlined N file mention(s)` aparece no transcript; tokens não-resolvíveis (dir, inexistente, fora do sandbox) são deixados literais para o modelo decidir. `@` no meio de uma palavra (ex.: `me@host.com`) não é tratado como menção.
-- Slash commands existentes funcionam (/exit /clear /model /tools /cwd /continue) + `/help`.
+- Slash commands existentes funcionam (/exit /clear /model /tools /cwd /continue /compact) + `/help`.
+- `/compact` mostra feedback curto, faz uma chamada sem tools para resumir a conversa, preserva o system prompt e troca o histórico antigo por uma única mensagem de contexto compactado.
 - Histórico de inputs com ↑/↓ (em memória, sessão apenas).
 
 ### B5. Robustez

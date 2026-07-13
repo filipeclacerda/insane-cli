@@ -188,11 +188,18 @@ async fn run(cli: Cli) -> i32 {
         quiet: cli.quiet,
     };
 
-    let result = tokio::select! {
-        res = run_command(&cli, out) => res,
-        _ = tokio::signal::ctrl_c() => {
-            output::log_info(out, "^C received, cancelling...");
-            Err(ApiError::Cancelled)
+    // Chat owns Ctrl+C while a turn is active so its per-turn token can end
+    // model/tool work cleanly. Other commands keep the process-level handler.
+    let is_chat = matches!(cli.resolved_command(), Command::Chat { .. });
+    let result = if is_chat {
+        run_command(&cli, out).await
+    } else {
+        tokio::select! {
+            res = run_command(&cli, out) => res,
+            _ = tokio::signal::ctrl_c() => {
+                output::log_info(out, "^C received, cancelling...");
+                Err(ApiError::Cancelled)
+            }
         }
     };
 

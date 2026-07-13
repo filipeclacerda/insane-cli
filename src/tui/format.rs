@@ -87,7 +87,10 @@ pub fn truncate_summary(text: &str, max_chars: usize) -> String {
     if normalized.chars().count() <= max_chars {
         return normalized;
     }
-    let mut out: String = normalized.chars().take(max_chars.saturating_sub(1)).collect();
+    let mut out: String = normalized
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect();
     out.push('…');
     out
 }

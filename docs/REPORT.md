@@ -388,3 +388,18 @@ provar o caminho de skip em CI.
   desenvolvimento**, não do CLI em si; um binário assinado (code signing)
   eliminaria o bloqueio em produção, mas está fora do escopo/orçamento desta
   fase.
+
+## Atualização -- rate do agente e compactação de conversa
+
+- `agent.max_rounds` volta a ser um limite real de rodadas por turno: ao
+  atingir o valor configurado, o agente encerra o turno com
+  `finish_reason="max_rounds"` antes de gastar outra requisição.
+- O cooldown preventivo antes de uma nova rodada agora usa
+  `[agent] rate_cooldown_pct` / `INSANE_AGENT_RATE_COOLDOWN_PCT` (default
+  75, `0` desativa), separado dos limites reais do provider
+  (`rate_limit.rpm` e `rate_limit.min_interval`).
+- `/compact` foi adicionado ao chat plain e à TUI. Ele faz uma chamada
+  não-tool ao modelo atual, resume o histórico em um bloco curto de contexto
+  e substitui mensagens antigas por esse resumo, preservando o system prompt.
+  O tamanho máximo da resposta é controlado por
+  `[agent] compact_max_tokens` / `INSANE_AGENT_COMPACT_MAX_TOKENS`.

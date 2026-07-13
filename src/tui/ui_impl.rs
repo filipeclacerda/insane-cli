@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::client::Usage;
-use crate::ui::{AgentUi, ConfirmRequest, Decision};
+use crate::ui::{AgentUi, CommandStream, ConfirmRequest, Decision};
 
 use super::app::{AppState, PendingConfirm};
 
@@ -25,7 +25,11 @@ impl TuiUi {
 
 #[async_trait::async_trait]
 impl AgentUi for TuiUi {
-    async fn confirm(&self, req: ConfirmRequest) -> Decision {
+    async fn confirm_with_cancel(
+        &self,
+        req: ConfirmRequest,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Decision {
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
             let mut st = self.state.lock().unwrap();
@@ -37,7 +41,13 @@ impl AgentUi for TuiUi {
             });
             st.dirty = true;
         }
-        rx.await.unwrap_or(Decision::No)
+        tokio::select! {
+            answer = rx => answer.unwrap_or(Decision::No),
+            _ = cancellation.cancelled() => {
+                self.cancel_pending_confirmation();
+                Decision::Cancelled
+            }
+        }
     }
 
     fn tool_trace(&self, name: &str, arguments: &str) {
@@ -68,6 +78,19 @@ impl AgentUi for TuiUi {
     fn stream_thinking(&self, chunk: &str) {
         let mut st = self.state.lock().unwrap();
         st.push_thinking_chunk(chunk);
+    }
+
+    fn command_output(&self, stream: CommandStream, chunk: &str) {
+        let mut st = self.state.lock().unwrap();
+        st.append_command_output(stream, chunk);
+    }
+
+    fn cancel_pending_confirmation(&self) {
+        let mut st = self.state.lock().unwrap();
+        if let Some(pending) = st.confirm.take() {
+            let _ = pending.responder.send(Decision::No);
+            st.dirty = true;
+        }
     }
 
     fn discard_last_assistant_message(&self) {
@@ -122,5 +145,41 @@ fn tool_call_text(name: &str, summary: &str) -> String {
         format!("{name}()")
     } else {
         format!("{name}({summary})")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::AgentUi;
+
+    #[tokio::test]
+    async fn cancel_pending_confirmation_closes_modal_and_answers_no() {
+        let state = Arc::new(Mutex::new(AppState::new(
+            "m".into(),
+            ".".into(),
+            ".".into(),
+        )));
+        let ui = TuiUi::new(state.clone());
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let confirm = ui.confirm_with_cancel(
+            ConfirmRequest {
+                tool: "run_command".into(),
+                prompt: "Run?".into(),
+                details: None,
+                diff: None,
+                command: Some("sleep 1".into()),
+            },
+            &cancellation,
+        );
+        tokio::pin!(confirm);
+        tokio::select! {
+            _ = &mut confirm => panic!("confirmation must wait"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert!(state.lock().unwrap().confirm.is_some());
+        ui.cancel_pending_confirmation();
+        assert!(state.lock().unwrap().confirm.is_none());
+        assert_eq!(confirm.await, Decision::No);
     }
 }

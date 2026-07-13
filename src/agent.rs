@@ -26,6 +26,7 @@ use crate::session::Session;
 use crate::tools::{self, permission::Permissions, ToolExecCtx};
 use crate::ui::AgentUi;
 use crate::AppContext;
+use tokio_util::sync::CancellationToken;
 
 /// Cap on the number of project-snapshot entries embedded in the system
 /// prompt (SPEC-UX A1).
@@ -157,15 +158,20 @@ const SPINNER_FRAMES: &[char] = &[
 /// request won't have to wait. A pure function so both `PlainUi` and the
 /// TUI can reuse it without duplicating the wording.
 async fn rate_limit_wait_message(ctx: &AppContext) -> Option<String> {
-    let metrics = ctx.limiter.metrics().await;
-    if metrics.next_below_75pct_in_ms > 0 {
-        let secs = metrics.next_below_75pct_in_ms.div_ceil(1000);
+    let pct = ctx.cfg.agent_rate_cooldown_pct;
+    if pct == 0 || pct >= 100 {
+        return None;
+    }
+    let wait_ms = ctx.limiter.next_below_percent_in_ms(pct).await;
+    if wait_ms > 0 {
+        let metrics = ctx.limiter.metrics().await;
+        let secs = wait_ms.div_ceil(1000);
         let capacity = metrics
             .capacity
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unlimited".to_string());
         Some(format!(
-            "rate limit: cooling down {secs}s until usage drops below 75% ({}/{capacity} used)",
+            "rate limit: cooling down {secs}s until usage drops to {pct}% or less ({}/{capacity} used)",
             metrics.used
         ))
     } else {
@@ -382,18 +388,41 @@ pub async fn run_turn(
     session: &mut Session,
     permissions: &mut Permissions,
     cwd: &Path,
-    _max_rounds: u32,
+    max_rounds: u32,
     ui: &dyn AgentUi,
 ) -> Result<TurnOutcome, ApiError> {
-    run_turn_with_tool_defs(
+    run_turn_with_cancel(
         ctx,
         session,
         permissions,
         cwd,
-        _max_rounds,
+        max_rounds,
         ui,
-        tools::all_tool_defs(),
+        CancellationToken::new(),
     )
+    .await
+}
+
+/// Runs one turn using the supplied turn-scoped cancellation token.
+pub async fn run_turn_with_cancel(
+    ctx: &AppContext,
+    session: &mut Session,
+    permissions: &mut Permissions,
+    cwd: &Path,
+    max_rounds: u32,
+    ui: &dyn AgentUi,
+    cancellation: CancellationToken,
+) -> Result<TurnOutcome, ApiError> {
+    run_turn_with_tool_defs_and_cancel(RunTurnArgs {
+        ctx,
+        session,
+        permissions,
+        cwd,
+        max_rounds,
+        ui,
+        tool_defs: tools::all_tool_defs(),
+        cancellation,
+    })
     .await
 }
 
@@ -402,10 +431,49 @@ pub async fn run_turn_with_tool_defs(
     session: &mut Session,
     permissions: &mut Permissions,
     cwd: &Path,
-    _max_rounds: u32,
+    max_rounds: u32,
     ui: &dyn AgentUi,
     tool_defs: Vec<ToolDef>,
 ) -> Result<TurnOutcome, ApiError> {
+    run_turn_with_tool_defs_and_cancel(RunTurnArgs {
+        ctx,
+        session,
+        permissions,
+        cwd,
+        max_rounds,
+        ui,
+        tool_defs,
+        cancellation: CancellationToken::new(),
+    })
+    .await
+}
+
+/// Variant for surfaces that restrict tool definitions but still own a turn
+/// cancellation token (the TUI PLAN mode).
+pub struct RunTurnArgs<'a> {
+    pub ctx: &'a AppContext,
+    pub session: &'a mut Session,
+    pub permissions: &'a mut Permissions,
+    pub cwd: &'a Path,
+    pub max_rounds: u32,
+    pub ui: &'a dyn AgentUi,
+    pub tool_defs: Vec<ToolDef>,
+    pub cancellation: CancellationToken,
+}
+
+pub async fn run_turn_with_tool_defs_and_cancel(
+    args: RunTurnArgs<'_>,
+) -> Result<TurnOutcome, ApiError> {
+    let RunTurnArgs {
+        ctx,
+        session,
+        permissions,
+        cwd,
+        max_rounds,
+        ui,
+        tool_defs,
+        cancellation,
+    } = args;
     let known_tools: Vec<&str> = tool_defs.iter().map(|d| d.function.name.as_str()).collect();
     let all_tool_names: Vec<String> = tools::all_tool_defs()
         .into_iter()
@@ -418,10 +486,42 @@ pub async fn run_turn_with_tool_defs(
 
     let mut rounds = 0u32;
     loop {
+        if cancellation.is_cancelled() {
+            return Ok(cancelled_turn(
+                ui,
+                rounds,
+                tools_executed,
+                turn_usage,
+                turn_start,
+            ));
+        }
+        if rounds >= max_rounds {
+            ui.warn(&format!(
+                "warning: agent reached max_rounds={max_rounds}; stopping this turn"
+            ));
+            ui.turn_summary(
+                rounds,
+                tools_executed,
+                turn_usage.as_ref(),
+                turn_start.elapsed(),
+            );
+            return Ok(TurnOutcome {
+                finish_reason: Some("max_rounds".to_string()),
+                last_text: String::new(),
+                rounds,
+                tools_executed,
+                usage: turn_usage,
+            });
+        }
         if let Some(msg) = rate_limit_wait_message(ctx).await {
             ui.warn(&msg);
         }
-        ctx.limiter.wait_until_below_fraction(3, 4).await;
+        tokio::select! {
+            _ = ctx.limiter.wait_until_below_percent(ctx.cfg.agent_rate_cooldown_pct) => {}
+            _ = cancellation.cancelled() => {
+                return Ok(cancelled_turn(ui, rounds, tools_executed, turn_usage, turn_start));
+            }
+        }
 
         let req = ChatRequest {
             model: session.model.clone(),
@@ -435,18 +535,16 @@ pub async fn run_turn_with_tool_defs(
             tool_choice: Some("auto".to_string()),
         };
 
-        let round_outcome = run_round_with_spinner(ctx, req, ui).await;
+        let round_outcome = run_round_with_spinner(ctx, req, ui, &cancellation).await;
 
         let Some(round_result) = round_outcome else {
-            ui.end_of_stream();
-            ui.warn("^C received, cancelling this turn");
-            return Ok(TurnOutcome {
-                finish_reason: None,
-                last_text: String::new(),
+            return Ok(cancelled_turn(
+                ui,
                 rounds,
                 tools_executed,
-                usage: turn_usage,
-            });
+                turn_usage,
+                turn_start,
+            ));
         };
         rounds += 1;
 
@@ -521,10 +619,23 @@ resume"
         };
         session.push_assistant_tool_calls(assistant_content, tool_calls.clone());
 
-        for call in &tool_calls {
-            if !call.id.starts_with("text_call_") {
-                ui.tool_trace(&call.function.name, &call.function.arguments);
+        for (index, call) in tool_calls.iter().enumerate() {
+            if cancellation.is_cancelled() {
+                append_cancelled_tool_results(
+                    &tool_calls[index..],
+                    session,
+                    ui,
+                    &mut tools_executed,
+                );
+                return Ok(cancelled_turn(
+                    ui,
+                    rounds,
+                    tools_executed,
+                    turn_usage,
+                    turn_start,
+                ));
             }
+            ui.tool_trace(&call.function.name, &call.function.arguments);
             let t0 = Instant::now();
             let result = if known_tools.contains(&call.function.name.as_str()) {
                 let mut ectx = ToolExecCtx {
@@ -532,6 +643,9 @@ resume"
                     max_context_bytes: ctx.cfg.max_context_bytes,
                     extra_ignore: &ctx.cfg.ignore,
                     permissions,
+                    cancellation: &cancellation,
+                    ui,
+                    turn_id: 0,
                 };
                 tools::execute(&call.function.name, &call.function.arguments, &mut ectx).await
             } else if all_tool_names
@@ -549,6 +663,9 @@ resume"
                     max_context_bytes: ctx.cfg.max_context_bytes,
                     extra_ignore: &ctx.cfg.ignore,
                     permissions,
+                    cancellation: &cancellation,
+                    ui,
+                    turn_id: 0,
                 };
                 tools::execute(&call.function.name, &call.function.arguments, &mut ectx).await
             };
@@ -561,8 +678,67 @@ resume"
             );
             tools_executed += 1;
             session.push_tool_result(call.id.clone(), result);
+            if cancellation.is_cancelled() {
+                append_cancelled_tool_results(
+                    &tool_calls[index + 1..],
+                    session,
+                    ui,
+                    &mut tools_executed,
+                );
+                return Ok(cancelled_turn(
+                    ui,
+                    rounds,
+                    tools_executed,
+                    turn_usage,
+                    turn_start,
+                ));
+            }
         }
         // Loop continues: next round lets the model see the tool results.
+    }
+}
+
+fn cancelled_tool_result() -> String {
+    serde_json::json!({"ok": false, "error": "cancelled by user"}).to_string()
+}
+
+fn append_cancelled_tool_results(
+    calls: &[ToolCall],
+    session: &mut Session,
+    ui: &dyn AgentUi,
+    tools_executed: &mut u32,
+) {
+    for call in calls {
+        let result = cancelled_tool_result();
+        ui.tool_trace(&call.function.name, &call.function.arguments);
+        ui.tool_summary(
+            &call.function.name,
+            &call.function.arguments,
+            &result,
+            Duration::ZERO,
+        );
+        session.push_tool_result(call.id.clone(), result);
+        *tools_executed += 1;
+    }
+}
+
+fn cancelled_turn(
+    ui: &dyn AgentUi,
+    rounds: u32,
+    tools_executed: u32,
+    usage: Option<Usage>,
+    started: Instant,
+) -> TurnOutcome {
+    ui.end_of_stream();
+    ui.cancel_pending_confirmation();
+    ui.warn("^C received, cancelling this turn");
+    ui.turn_summary(rounds, tools_executed, usage.as_ref(), started.elapsed());
+    TurnOutcome {
+        finish_reason: Some("cancelled".to_string()),
+        last_text: String::new(),
+        rounds,
+        tools_executed,
+        usage,
     }
 }
 
@@ -577,6 +753,7 @@ async fn run_round_with_spinner(
     ctx: &AppContext,
     req: ChatRequest,
     ui: &dyn AgentUi,
+    cancellation: &CancellationToken,
 ) -> Option<Result<(String, Vec<ToolCall>, Option<String>, Option<Usage>), ApiError>> {
     let notify = Arc::new(tokio::sync::Notify::new());
     let round_call = stream_round(ctx, req, notify.clone(), ui);
@@ -592,7 +769,7 @@ async fn run_round_with_spinner(
     let outcome = loop {
         tokio::select! {
             res = &mut round_call => break Some(res),
-            _ = tokio::signal::ctrl_c() => break None,
+            _ = cancellation.cancelled() => break None,
             _ = &mut notified, if spinner_on => {
                 spinner_on = false;
                 ui.clear_status();

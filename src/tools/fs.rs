@@ -89,7 +89,10 @@ struct ListFilesArgs {
     max_entries: Option<usize>,
 }
 
-pub fn list_files(arguments: &str, ectx: &mut ToolExecCtx<'_>) -> Result<String, String> {
+pub async fn list_files(arguments: &str, ectx: &mut ToolExecCtx<'_>) -> Result<String, String> {
+    if ectx.cancellation.is_cancelled() {
+        return Err("cancelled by user".into());
+    }
     let args: ListFilesArgs = parse_args(arguments)?;
     let rel = args.path.unwrap_or_else(|| ".".to_string());
     let root = resolve_in_sandbox(&ectx.cwd, &rel)?;
@@ -101,35 +104,48 @@ pub fn list_files(arguments: &str, ectx: &mut ToolExecCtx<'_>) -> Result<String,
         .unwrap_or(MAX_LIST_ENTRIES)
         .min(MAX_LIST_ENTRIES);
 
-    let mut entries = Vec::new();
-    let walker = ignore::WalkBuilder::new(&root).build();
-    for result in walker {
-        let entry = match result {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        let path = entry.path();
-        if path == root {
-            continue;
+    let cwd = ectx.cwd.clone();
+    let extra_ignore = ectx.extra_ignore.to_vec();
+    let cancellation = ectx.cancellation.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut entries = Vec::new();
+        let walker = ignore::WalkBuilder::new(&root).build();
+        for result in walker {
+            if cancellation.is_cancelled() {
+                return Err("cancelled by user".into());
+            }
+            let entry = match result {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if path == root {
+                continue;
+            }
+            if context::check_denylist(path).is_err() {
+                continue;
+            }
+            if is_extra_ignored(path, &cwd, &extra_ignore) {
+                continue;
+            }
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let mut rel_path = display_relative(path, &cwd);
+            if is_dir {
+                rel_path.push('/');
+            }
+            entries.push(rel_path);
+            if entries.len() >= cap {
+                break;
+            }
         }
-        if context::check_denylist(path).is_err() {
-            continue;
+        entries.sort();
+        if cancellation.is_cancelled() {
+            return Err("cancelled by user".into());
         }
-        if is_extra_ignored(path, &ectx.cwd, ectx.extra_ignore) {
-            continue;
-        }
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        let mut rel_path = display_relative(path, &ectx.cwd);
-        if is_dir {
-            rel_path.push('/');
-        }
-        entries.push(rel_path);
-        if entries.len() >= cap {
-            break;
-        }
-    }
-    entries.sort();
-    Ok(entries.join("\n"))
+        Ok(entries.join("\n"))
+    })
+    .await
+    .map_err(|e| format!("list_files worker failed: {e}"))?
 }
 
 #[derive(Deserialize)]
@@ -140,6 +156,9 @@ struct ReadFileArgs {
 }
 
 pub async fn read_file(arguments: &str, ectx: &mut ToolExecCtx<'_>) -> Result<String, String> {
+    if ectx.cancellation.is_cancelled() {
+        return Err("cancelled by user".into());
+    }
     let args: ReadFileArgs = parse_args(arguments)?;
     let resolved = resolve_in_sandbox(&ectx.cwd, &args.path)?;
     context::check_denylist(&resolved).map_err(|e| e.to_string())?;
@@ -147,8 +166,14 @@ pub async fn read_file(arguments: &str, ectx: &mut ToolExecCtx<'_>) -> Result<St
         return Err(format!("`{}` is not a regular file", args.path));
     }
 
-    let bytes =
-        std::fs::read(&resolved).map_err(|e| format!("failed to read {}: {e}", args.path))?;
+    let display = args.path.clone();
+    let bytes = tokio::task::spawn_blocking(move || std::fs::read(&resolved))
+        .await
+        .map_err(|e| format!("read_file worker failed: {e}"))?
+        .map_err(|e| format!("failed to read {display}: {e}"))?;
+    if ectx.cancellation.is_cancelled() {
+        return Err("cancelled by user".into());
+    }
     let text = String::from_utf8_lossy(&bytes).into_owned();
 
     let range = match (args.start_line, args.end_line) {
@@ -172,6 +197,9 @@ struct SearchFilesArgs {
 }
 
 pub async fn search_files(arguments: &str, ectx: &mut ToolExecCtx<'_>) -> Result<String, String> {
+    if ectx.cancellation.is_cancelled() {
+        return Err("cancelled by user".into());
+    }
     let args: SearchFilesArgs = parse_args(arguments)?;
     let re = Regex::new(&args.pattern).map_err(|e| format!("invalid regex: {e}"))?;
     let rel = args.path.unwrap_or_else(|| ".".to_string());
@@ -181,38 +209,57 @@ pub async fn search_files(arguments: &str, ectx: &mut ToolExecCtx<'_>) -> Result
         .unwrap_or(MAX_SEARCH_RESULTS)
         .min(MAX_SEARCH_RESULTS);
 
-    let mut results = Vec::new();
-    let walker = ignore::WalkBuilder::new(&root).build();
-    'outer: for entry in walker {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-            continue;
-        }
-        let path = entry.path();
-        if context::check_denylist(path).is_err() {
-            continue;
-        }
-        if is_extra_ignored(path, &ectx.cwd, ectx.extra_ignore) {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue; // skip unreadable/binary files
-        };
-        let rel_path = display_relative(path, &ectx.cwd);
-        for (i, line) in text.lines().enumerate() {
-            if re.is_match(line) {
-                results.push(format!("{}:{}: {}", rel_path, i + 1, line));
-                if results.len() >= cap {
-                    break 'outer;
+    let cwd = ectx.cwd.clone();
+    let extra_ignore = ectx.extra_ignore.to_vec();
+    let cancellation = ectx.cancellation.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut results = Vec::new();
+        let walker = ignore::WalkBuilder::new(&root).build();
+        'outer: for entry in walker {
+            if cancellation.is_cancelled() {
+                return Err("cancelled by user".into());
+            }
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let path = entry.path();
+            if context::check_denylist(path).is_err() {
+                continue;
+            }
+            if is_extra_ignored(path, &cwd, &extra_ignore) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue; // skip unreadable/binary files
+            };
+            if cancellation.is_cancelled() {
+                return Err("cancelled by user".into());
+            }
+            let rel_path = display_relative(path, &cwd);
+            for (i, line) in text.lines().enumerate() {
+                if cancellation.is_cancelled() {
+                    return Err("cancelled by user".into());
+                }
+                if re.is_match(line) {
+                    results.push(format!("{}:{}: {}", rel_path, i + 1, line));
+                    if results.len() >= cap {
+                        break 'outer;
+                    }
                 }
             }
         }
-    }
 
-    Ok(results.join("\n"))
+        if cancellation.is_cancelled() {
+            return Err("cancelled by user".into());
+        }
+        Ok(results.join("\n"))
+    })
+    .await
+    .map_err(|e| format!("search_files worker failed: {e}"))?
 }
 
 #[derive(Deserialize)]
@@ -222,26 +269,51 @@ struct WriteFileArgs {
 }
 
 pub async fn write_file(arguments: &str, ectx: &mut ToolExecCtx<'_>) -> Result<String, String> {
+    if ectx.cancellation.is_cancelled() {
+        return Err("cancelled by user".into());
+    }
     let args: WriteFileArgs = parse_args(arguments)?;
     let resolved = resolve_in_sandbox(&ectx.cwd, &args.path)?;
     context::check_denylist(&resolved).map_err(|e| e.to_string())?;
 
-    let old = std::fs::read_to_string(&resolved).unwrap_or_default();
+    let read_path = resolved.clone();
+    let old =
+        tokio::task::spawn_blocking(move || std::fs::read_to_string(read_path).unwrap_or_default())
+            .await
+            .map_err(|e| format!("write_file read worker failed: {e}"))?;
+    if ectx.cancellation.is_cancelled() {
+        return Err("cancelled by user".into());
+    }
     let diff = build_diff(&old, &args.content, &args.path);
 
-    if !ectx
+    match ectx
         .permissions
         .confirm_with_diff(
             "write_file",
             &format!("Write to {}?", args.path),
             Some(&diff),
+            ectx.cancellation,
         )
         .await
     {
-        return Err("user denied write".to_string());
+        super::permission::PermissionResult::Allowed => {}
+        super::permission::PermissionResult::Denied => return Err("user denied write".to_string()),
+        super::permission::PermissionResult::Cancelled => {
+            return Err("cancelled by user".to_string())
+        }
     }
 
-    fileops::write_atomic(&resolved, &args.content).map_err(|e| e.to_string())?;
+    if ectx.cancellation.is_cancelled() {
+        return Err("cancelled by user".into());
+    }
+    let content = args.content;
+    tokio::task::spawn_blocking(move || fileops::write_atomic(&resolved, &content))
+        .await
+        .map_err(|e| format!("write_file worker failed: {e}"))?
+        .map_err(|e| e.to_string())?;
+    if ectx.cancellation.is_cancelled() {
+        return Err("cancelled by user".into());
+    }
     Ok(format!("wrote {}", args.path))
 }
 
@@ -254,6 +326,9 @@ struct EditFileArgs {
 }
 
 pub async fn edit_file(arguments: &str, ectx: &mut ToolExecCtx<'_>) -> Result<String, String> {
+    if ectx.cancellation.is_cancelled() {
+        return Err("cancelled by user".into());
+    }
     let args: EditFileArgs = parse_args(arguments)?;
     if args.old_string.is_empty() {
         return Err("old_string must not be empty".to_string());
@@ -261,8 +336,15 @@ pub async fn edit_file(arguments: &str, ectx: &mut ToolExecCtx<'_>) -> Result<St
     let resolved = resolve_in_sandbox(&ectx.cwd, &args.path)?;
     context::check_denylist(&resolved).map_err(|e| e.to_string())?;
 
-    let content = std::fs::read_to_string(&resolved)
-        .map_err(|e| format!("failed to read {}: {e}", args.path))?;
+    let read_path = resolved.clone();
+    let display = args.path.clone();
+    let content = tokio::task::spawn_blocking(move || std::fs::read_to_string(read_path))
+        .await
+        .map_err(|e| format!("edit_file read worker failed: {e}"))?
+        .map_err(|e| format!("failed to read {display}: {e}"))?;
+    if ectx.cancellation.is_cancelled() {
+        return Err("cancelled by user".into());
+    }
     let count = content.matches(args.old_string.as_str()).count();
     if count == 0 {
         return Err(format!("old_string not found in {}", args.path));
@@ -283,18 +365,32 @@ old_string more specific",
     };
 
     let diff = build_diff(&content, &new_content, &args.path);
-    if !ectx
+    match ectx
         .permissions
         .confirm_with_diff(
             "edit_file",
             &format!("Apply this edit to {}?", args.path),
             Some(&diff),
+            ectx.cancellation,
         )
         .await
     {
-        return Err("user denied edit".to_string());
+        super::permission::PermissionResult::Allowed => {}
+        super::permission::PermissionResult::Denied => return Err("user denied edit".to_string()),
+        super::permission::PermissionResult::Cancelled => {
+            return Err("cancelled by user".to_string())
+        }
     }
 
-    fileops::write_atomic(&resolved, &new_content).map_err(|e| e.to_string())?;
+    if ectx.cancellation.is_cancelled() {
+        return Err("cancelled by user".into());
+    }
+    tokio::task::spawn_blocking(move || fileops::write_atomic(&resolved, &new_content))
+        .await
+        .map_err(|e| format!("edit_file worker failed: {e}"))?
+        .map_err(|e| e.to_string())?;
+    if ectx.cancellation.is_cancelled() {
+        return Err("cancelled by user".into());
+    }
     Ok(format!("edited {}", args.path))
 }

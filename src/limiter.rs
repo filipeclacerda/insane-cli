@@ -232,11 +232,30 @@ impl RateLimiter {
         }
     }
 
-    /// Waits until the trailing-window usage drops strictly below
-    /// `numerator/denominator` of capacity. Unlimited capacity returns
-    /// immediately.
-    pub async fn wait_until_below_fraction(&self, numerator: usize, denominator: usize) {
-        if self.capacity.is_none() {
+    /// Milliseconds until trailing-window usage is at or below `percent` of
+    /// capacity. Unlimited capacity, `percent == 0`, or `percent >= 100`
+    /// returns 0.
+    pub async fn next_below_percent_in_ms(&self, percent: u32) -> u64 {
+        if self.capacity.is_none() || percent == 0 || percent >= 100 {
+            return 0;
+        }
+        let mut inner = self.inner.lock().await;
+        let now = Instant::now();
+        evict_expired(&mut inner.log, now, self.window);
+        ms_until_below_percent(
+            &inner.log,
+            now,
+            self.window,
+            self.capacity.expect("checked above"),
+            percent,
+        )
+    }
+
+    /// Waits until trailing-window usage is at or below `percent` of
+    /// capacity. Unlimited capacity, `percent == 0`, or `percent >= 100`
+    /// returns immediately.
+    pub async fn wait_until_below_percent(&self, percent: u32) {
+        if self.capacity.is_none() || percent == 0 || percent >= 100 {
             return;
         }
         loop {
@@ -244,13 +263,12 @@ impl RateLimiter {
                 let mut inner = self.inner.lock().await;
                 let now = Instant::now();
                 evict_expired(&mut inner.log, now, self.window);
-                ms_until_below_fraction(
+                ms_until_below_percent(
                     &inner.log,
                     now,
                     self.window,
                     self.capacity.expect("checked above"),
-                    numerator,
-                    denominator,
+                    percent,
                 )
             };
             if wait == 0 {
@@ -261,6 +279,17 @@ impl RateLimiter {
                 _ = self.notify.notified() => {}
             }
         }
+    }
+
+    /// Waits until the trailing-window usage drops strictly below
+    /// `numerator/denominator` of capacity. Unlimited capacity returns
+    /// immediately.
+    pub async fn wait_until_below_fraction(&self, numerator: usize, denominator: usize) {
+        if denominator == 0 {
+            return;
+        }
+        let percent = ((numerator as u64) * 100 / (denominator as u64)).min(100) as u32;
+        self.wait_until_below_percent(percent).await;
     }
 }
 
@@ -283,6 +312,27 @@ fn ms_until_below_fraction(
     denominator: usize,
 ) -> u64 {
     let threshold = (capacity * numerator) / denominator;
+    if log.len() < threshold.saturating_add(1) {
+        return 0;
+    }
+    let idx = log.len() - threshold;
+    log.get(idx)
+        .map(|instant| {
+            (*instant + window)
+                .saturating_duration_since(now)
+                .as_millis() as u64
+        })
+        .unwrap_or(0)
+}
+
+fn ms_until_below_percent(
+    log: &VecDeque<Instant>,
+    now: Instant,
+    window: Duration,
+    capacity: usize,
+    percent: u32,
+) -> u64 {
+    let threshold = ((capacity as u64) * (percent as u64) / 100) as usize;
     if log.len() < threshold.saturating_add(1) {
         return 0;
     }

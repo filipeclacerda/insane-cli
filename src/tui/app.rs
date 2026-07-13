@@ -10,7 +10,7 @@ use crate::client::Usage;
 use crate::context;
 use crate::session::SLASH_COMMANDS;
 use crate::session_store::SessionSummary;
-use crate::ui::ConfirmRequest;
+use crate::ui::{CommandStream, ConfirmRequest};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InteractionMode {
@@ -77,6 +77,12 @@ pub enum ToolStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolOutputLine {
+    pub stream: CommandStream,
+    pub text: String,
+}
+
 /// One entry in the transcript.
 #[derive(Debug, Clone)]
 pub enum MsgBlock {
@@ -91,6 +97,9 @@ pub enum MsgBlock {
         status: ToolStatus,
         call: String,
         result: Option<String>,
+        output: Vec<ToolOutputLine>,
+        output_truncated: bool,
+        expanded: bool,
     },
     /// A warning/notice (finish_reason, rate limit, recovered text call).
     Warn(String),
@@ -165,6 +174,9 @@ pub struct AppState {
     /// Enter-to-submit is delayed by one render tick so terminals that emit
     /// pasted newlines as Enter key events can still keep multiline paste intact.
     pub pending_submit: Option<String>,
+    /// Set by `/compact`; consumed by the main TUI loop to run the
+    /// async compaction request outside normal tool-calling turns.
+    pub pending_compact: bool,
     pub input_history: Vec<String>,
     /// Index into `input_history` while browsing with Up/Down; `None` means
     /// "not currently browsing" (editing the live input).
@@ -205,6 +217,7 @@ impl AppState {
             input: String::new(),
             cursor: 0,
             pending_submit: None,
+            pending_compact: false,
             input_history: Vec::new(),
             history_idx: None,
             suggestion_idx: 0,
@@ -342,8 +355,48 @@ impl AppState {
             status: ToolStatus::Running,
             call,
             result: None,
+            output: Vec::new(),
+            output_truncated: false,
+            expanded: true,
         });
         self.dirty = true;
+    }
+
+    pub fn append_command_output(&mut self, stream: CommandStream, chunk: &str) {
+        const MAX_OUTPUT_LINES: usize = 200;
+        const MAX_OUTPUT_BYTES: usize = 16 * 1024;
+        if let Some(MsgBlock::Tool {
+            status: ToolStatus::Running,
+            output,
+            output_truncated,
+            ..
+        }) = self.messages.iter_mut().rev().find(|msg| {
+            matches!(msg, MsgBlock::Tool { status: ToolStatus::Running, call, .. } if call.starts_with("run_command("))
+        }) {
+            for text in chunk.lines() {
+                output.push(ToolOutputLine { stream, text: text.to_string() });
+            }
+            while output.len() > MAX_OUTPUT_LINES || output.iter().map(|line| line.text.len()).sum::<usize>() > MAX_OUTPUT_BYTES {
+                output.remove(0);
+                *output_truncated = true;
+            }
+            self.dirty = true;
+        }
+    }
+
+    pub fn toggle_latest_command_output(&mut self) -> bool {
+        if let Some(MsgBlock::Tool {
+            output, expanded, ..
+        }) = self.messages.iter_mut().rev().find(
+            |msg| matches!(msg, MsgBlock::Tool { call, .. } if call.starts_with("run_command(")),
+        ) {
+            if !output.is_empty() {
+                *expanded = !*expanded;
+                self.dirty = true;
+                return true;
+            }
+        }
+        false
     }
 
     pub fn finish_tool(&mut self, ok: bool, call: String, result: String) {
@@ -357,15 +410,23 @@ impl AppState {
             )
         });
         if let Some(idx) = running {
-            self.messages[idx] = MsgBlock::Tool {
-                status: if ok {
+            if let MsgBlock::Tool {
+                status,
+                call: existing_call,
+                result: existing_result,
+                expanded,
+                ..
+            } = &mut self.messages[idx]
+            {
+                *status = if ok {
                     ToolStatus::Success
                 } else {
                     ToolStatus::Failed
-                },
-                call,
-                result: Some(result),
-            };
+                };
+                *existing_call = call;
+                *existing_result = Some(result);
+                *expanded = !ok;
+            }
         } else {
             self.messages.push(MsgBlock::Tool {
                 status: if ok {
@@ -375,6 +436,9 @@ impl AppState {
                 },
                 call,
                 result: Some(result),
+                output: Vec::new(),
+                output_truncated: false,
+                expanded: false,
             });
         }
         self.dirty = true;
@@ -1009,6 +1073,80 @@ mod tests {
         app.set_input("contact a@READ".into());
         let suggestions = app.suggestions();
         assert!(suggestions.is_empty());
+    }
+
+    #[test]
+    fn command_output_appends_only_to_latest_running_run_command() {
+        use crate::ui::CommandStream;
+
+        let mut app = AppState::new("m".into(), ".".into(), ".".into());
+        app.push_tool_running("run_command(first)".into());
+        app.push_tool_running("read_file(src/lib.rs)".into());
+        app.append_command_output(CommandStream::Stdout, "one\n");
+
+        assert!(matches!(
+            &app.messages[0],
+            MsgBlock::Tool { output, .. }
+                if output == &vec![ToolOutputLine { stream: CommandStream::Stdout, text: "one".into() }]
+        ));
+        assert!(matches!(&app.messages[1], MsgBlock::Tool { output, .. } if output.is_empty()));
+    }
+
+    #[test]
+    fn command_output_is_bounded_to_a_tail_with_one_truncation_marker() {
+        use crate::ui::CommandStream;
+
+        let mut app = AppState::new("m".into(), ".".into(), ".".into());
+        app.push_tool_running("run_command(noisy)".into());
+        for index in 0..250 {
+            app.append_command_output(CommandStream::Stderr, &format!("line-{index}\n"));
+        }
+
+        let MsgBlock::Tool {
+            output,
+            output_truncated,
+            ..
+        } = &app.messages[0]
+        else {
+            panic!("missing tool")
+        };
+        assert!(*output_truncated);
+        assert!(output.len() <= 200);
+        assert_eq!(output.first().unwrap().text, "line-50");
+        assert_eq!(output.last().unwrap().text, "line-249");
+    }
+
+    #[test]
+    fn command_output_survives_finish_and_failure_stays_expanded() {
+        use crate::ui::CommandStream;
+
+        let mut app = AppState::new("m".into(), ".".into(), ".".into());
+        app.push_tool_running("run_command(echo one)".into());
+        app.append_command_output(CommandStream::Stdout, "one\n");
+        app.finish_tool(false, "run_command(echo one)".into(), "failed".into());
+
+        assert!(matches!(
+            &app.messages[0],
+            MsgBlock::Tool { output, result: Some(result), expanded: true, .. }
+                if output == &vec![ToolOutputLine { stream: CommandStream::Stdout, text: "one".into() }]
+                    && result == "failed"
+        ));
+    }
+
+    #[test]
+    fn latest_command_output_can_be_toggled_after_finish() {
+        use crate::ui::CommandStream;
+
+        let mut app = AppState::new("m".into(), ".".into(), ".".into());
+        app.push_tool_running("run_command(echo one)".into());
+        app.append_command_output(CommandStream::Stdout, "one\n");
+        app.finish_tool(true, "run_command(echo one)".into(), "done".into());
+
+        assert!(app.toggle_latest_command_output());
+        assert!(matches!(
+            &app.messages[0],
+            MsgBlock::Tool { expanded: true, .. }
+        ));
     }
 
     #[test]

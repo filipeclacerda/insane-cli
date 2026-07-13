@@ -12,6 +12,20 @@
 use std::collections::HashSet;
 
 use crate::ui::{AgentUi, ConfirmRequest, Decision, PlainUi};
+use tokio_util::sync::CancellationToken;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionResult {
+    Allowed,
+    Denied,
+    Cancelled,
+}
+
+impl PermissionResult {
+    pub fn allowed(self) -> bool {
+        self == Self::Allowed
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ApprovalPolicy {
@@ -62,14 +76,31 @@ impl Permissions {
     /// Confirms a non-shell tool action (`write_file`, `edit_file`, or a
     /// secret-detected `read_file`/`search_files`). `tool` scopes the
     /// "always" answer.
-    pub async fn confirm(&mut self, tool: &str, prompt: &str) -> bool {
-        self.confirm_with_diff(tool, prompt, None).await
+    pub async fn confirm(&mut self, tool: &str, prompt: &str) -> PermissionResult {
+        self.confirm_with_cancel(tool, prompt, &CancellationToken::new())
+            .await
+    }
+
+    pub async fn confirm_with_cancel(
+        &mut self,
+        tool: &str,
+        prompt: &str,
+        cancellation: &CancellationToken,
+    ) -> PermissionResult {
+        self.confirm_request(tool, prompt, None, None, cancellation)
+            .await
     }
 
     /// Confirms an action while keeping its explanatory text inside the
     /// same modal as the decision.
-    pub async fn confirm_with_details(&mut self, tool: &str, prompt: &str, details: &str) -> bool {
-        self.confirm_request(tool, prompt, Some(details), None)
+    pub async fn confirm_with_details(
+        &mut self,
+        tool: &str,
+        prompt: &str,
+        details: &str,
+        cancellation: &CancellationToken,
+    ) -> PermissionResult {
+        self.confirm_request(tool, prompt, Some(details), None, cancellation)
             .await
     }
 
@@ -80,8 +111,10 @@ impl Permissions {
         tool: &str,
         prompt: &str,
         diff: Option<&str>,
-    ) -> bool {
-        self.confirm_request(tool, prompt, None, diff).await
+        cancellation: &CancellationToken,
+    ) -> PermissionResult {
+        self.confirm_request(tool, prompt, None, diff, cancellation)
+            .await
     }
 
     async fn confirm_request(
@@ -90,16 +123,17 @@ impl Permissions {
         prompt: &str,
         details: Option<&str>,
         diff: Option<&str>,
-    ) -> bool {
+        cancellation: &CancellationToken,
+    ) -> PermissionResult {
         if matches!(tool, "write_file" | "edit_file") {
             match self.policy {
-                ApprovalPolicy::Auto => return true,
-                ApprovalPolicy::AcceptEdits => return true,
+                ApprovalPolicy::Auto => return PermissionResult::Allowed,
+                ApprovalPolicy::AcceptEdits => return PermissionResult::Allowed,
                 ApprovalPolicy::Default => {}
             }
         }
         if self.always_tools.contains(tool) {
-            return true;
+            return PermissionResult::Allowed;
         }
         let req = ConfirmRequest {
             tool: tool.to_string(),
@@ -108,27 +142,32 @@ impl Permissions {
             diff: diff.map(str::to_string),
             command: None,
         };
-        match self.ui.confirm(req).await {
-            Decision::Yes => true,
+        match self.ui.confirm_with_cancel(req, cancellation).await {
+            Decision::Yes => PermissionResult::Allowed,
             Decision::Always => {
                 if !matches!(tool, "read_file" | "search_files") {
                     self.always_tools.insert(tool.to_string());
                 }
-                true
+                PermissionResult::Allowed
             }
-            Decision::No => false,
+            Decision::No => PermissionResult::Denied,
+            Decision::Cancelled => PermissionResult::Cancelled,
         }
     }
 
     /// Confirms `run_command`. Always prompts (SPEC-AGENT §2/§3); `a` only
     /// remembers this exact command string, never shell commands in
     /// general.
-    pub async fn confirm_command(&mut self, command: &str) -> bool {
+    pub async fn confirm_command(
+        &mut self,
+        command: &str,
+        cancellation: &CancellationToken,
+    ) -> PermissionResult {
         if self.policy == ApprovalPolicy::Auto {
-            return true;
+            return PermissionResult::Allowed;
         }
         if self.always_commands.contains(command) {
-            return true;
+            return PermissionResult::Allowed;
         }
         let req = ConfirmRequest {
             tool: "run_command".to_string(),
@@ -137,13 +176,14 @@ impl Permissions {
             diff: None,
             command: Some(command.to_string()),
         };
-        match self.ui.confirm(req).await {
-            Decision::Yes => true,
+        match self.ui.confirm_with_cancel(req, cancellation).await {
+            Decision::Yes => PermissionResult::Allowed,
             Decision::Always => {
                 self.always_commands.insert(command.to_string());
-                true
+                PermissionResult::Allowed
             }
-            Decision::No => false,
+            Decision::No => PermissionResult::Denied,
+            Decision::Cancelled => PermissionResult::Cancelled,
         }
     }
 
@@ -183,8 +223,30 @@ mod tests {
     async fn non_tty_stdin_always_refuses() {
         // A `FakeUi` that always answers `No` -- tests never touch real stdin.
         let mut p = Permissions::with_ui(Box::new(FakeUi::deny()));
-        assert!(!p.confirm("write_file", "write?").await);
-        assert!(!p.confirm_command("echo hi").await);
+        assert_eq!(
+            p.confirm("write_file", "write?").await,
+            PermissionResult::Denied
+        );
+        assert_eq!(
+            p.confirm_command("echo hi", &CancellationToken::new())
+                .await,
+            PermissionResult::Denied
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_confirmation_is_distinct_from_denial() {
+        let mut denied = Permissions::with_ui(Box::new(FakeUi::deny()));
+        let mut cancelled = Permissions::with_ui(Box::new(FakeUi::cancelled()));
+
+        assert_eq!(
+            denied.confirm("write_file", "write?").await,
+            PermissionResult::Denied
+        );
+        assert_eq!(
+            cancelled.confirm("write_file", "write?").await,
+            PermissionResult::Cancelled
+        );
     }
 
     #[test]
@@ -198,16 +260,23 @@ mod tests {
     async fn accept_edits_skips_file_prompt_but_not_shell_prompt() {
         let mut p = Permissions::with_ui(Box::new(FakeUi::deny()));
         p.set_policy(ApprovalPolicy::AcceptEdits);
-        assert!(p.confirm("write_file", "write?").await);
-        assert!(p.confirm("edit_file", "edit?").await);
-        assert!(!p.confirm_command("echo hi").await);
+        assert!(p.confirm("write_file", "write?").await.allowed());
+        assert!(p.confirm("edit_file", "edit?").await.allowed());
+        assert_eq!(
+            p.confirm_command("echo hi", &CancellationToken::new())
+                .await,
+            PermissionResult::Denied
+        );
     }
 
     #[tokio::test]
     async fn auto_mode_skips_file_and_shell_prompts() {
         let mut p = Permissions::with_ui(Box::new(FakeUi::deny()));
         p.set_policy(ApprovalPolicy::Auto);
-        assert!(p.confirm("write_file", "write?").await);
-        assert!(p.confirm_command("echo hi").await);
+        assert!(p.confirm("write_file", "write?").await.allowed());
+        assert!(p
+            .confirm_command("echo hi", &CancellationToken::new())
+            .await
+            .allowed());
     }
 }

@@ -33,6 +33,12 @@ pub const NIM_RPM_CEILING: u32 = 40;
 pub const DEFAULT_MAX_CONTEXT_BYTES: usize = 192 * 1024;
 /// Default cap on tool-calling rounds per user turn (SPEC-AGENT §4).
 pub const DEFAULT_AGENT_MAX_ROUNDS: u32 = 20;
+/// Default pre-cooldown threshold for agent rounds. The agent waits until
+/// trailing-window rate-limit usage is at or below this percentage before
+/// starting another model round. Set to 0 to disable this preventive wait.
+pub const DEFAULT_AGENT_RATE_COOLDOWN_PCT: u32 = 75;
+/// Default maximum completion size for `/compact` summaries.
+pub const DEFAULT_AGENT_COMPACT_MAX_TOKENS: u32 = 1024;
 /// Default `ui` mode (SPEC-UX Part B): the fullscreen TUI when the terminal
 /// supports it, falling back to line mode automatically for non-TTY
 /// stdin/stdout regardless of this setting.
@@ -113,6 +119,13 @@ pub struct AgentConfig {
     /// up with a clear error (SPEC-AGENT §4). Defaults to 20.
     #[serde(default)]
     pub max_rounds: Option<u32>,
+    /// Preventive rate-limit cooldown threshold for agent rounds. Defaults
+    /// to 75, matching the original hardcoded behavior; 0 disables it.
+    #[serde(default)]
+    pub rate_cooldown_pct: Option<u32>,
+    /// Maximum completion tokens used by `/compact`.
+    #[serde(default)]
+    pub compact_max_tokens: Option<u32>,
     /// Generation temperature used specifically for agent (tool-calling)
     /// turns (SPEC-UX A2). Falls back to the global `temperature` if that
     /// was explicitly configured, else to `DEFAULT_AGENT_TEMPERATURE`.
@@ -185,6 +198,8 @@ pub struct EffectiveConfig {
     pub ignore: Vec<String>,
     pub max_context_bytes: usize,
     pub agent_max_rounds: u32,
+    pub agent_rate_cooldown_pct: u32,
+    pub agent_compact_max_tokens: u32,
     pub agent_temperature: f32,
     pub lenient_tool_calls: bool,
     pub system_prompt_extra: String,
@@ -364,6 +379,31 @@ pub fn load(cli: &Cli) -> Result<EffectiveConfig, ApiError> {
         .and_then(|v| v.parse().ok())
         .or(file.agent.max_rounds)
         .unwrap_or(DEFAULT_AGENT_MAX_ROUNDS);
+    if agent_max_rounds == 0 {
+        return Err(ApiError::Usage {
+            message: "agent.max_rounds must be greater than zero".to_string(),
+        });
+    }
+    let agent_rate_cooldown_pct = std::env::var("INSANE_AGENT_RATE_COOLDOWN_PCT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .or(file.agent.rate_cooldown_pct)
+        .unwrap_or(DEFAULT_AGENT_RATE_COOLDOWN_PCT);
+    if agent_rate_cooldown_pct > 100 {
+        return Err(ApiError::Usage {
+            message: "agent.rate_cooldown_pct must be between 0 and 100".to_string(),
+        });
+    }
+    let agent_compact_max_tokens = std::env::var("INSANE_AGENT_COMPACT_MAX_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .or(file.agent.compact_max_tokens)
+        .unwrap_or(DEFAULT_AGENT_COMPACT_MAX_TOKENS);
+    if agent_compact_max_tokens == 0 {
+        return Err(ApiError::Usage {
+            message: "agent.compact_max_tokens must be greater than zero".to_string(),
+        });
+    }
 
     // agent.temperature: explicit env/file value wins; otherwise fall back
     // to the global `temperature` *only if it was itself explicitly
@@ -421,6 +461,8 @@ pub fn load(cli: &Cli) -> Result<EffectiveConfig, ApiError> {
         ignore: file.ignore,
         max_context_bytes: DEFAULT_MAX_CONTEXT_BYTES,
         agent_max_rounds,
+        agent_rate_cooldown_pct,
+        agent_compact_max_tokens,
         agent_temperature,
         lenient_tool_calls,
         system_prompt_extra,
@@ -683,6 +725,109 @@ mod tests {
         ]);
         let effective = load(&cli).unwrap();
         assert_eq!(effective.agent_max_rounds, 5);
+    }
+
+    #[test]
+    fn agent_max_rounds_rejects_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[agent]\nmax_rounds = 0\n").unwrap();
+
+        let cli = Cli::parse_from([
+            "insane",
+            "--config",
+            config_path.to_str().unwrap(),
+            "status",
+        ]);
+        let err = load(&cli).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("agent.max_rounds must be greater than zero"));
+    }
+
+    #[test]
+    fn agent_rate_cooldown_pct_defaults_to_75() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let cli = Cli::parse_from([
+            "insane",
+            "--config",
+            config_path.to_str().unwrap(),
+            "status",
+        ]);
+        let effective = load(&cli).unwrap();
+        assert_eq!(
+            effective.agent_rate_cooldown_pct,
+            DEFAULT_AGENT_RATE_COOLDOWN_PCT
+        );
+    }
+
+    #[test]
+    fn agent_rate_cooldown_pct_configurable_via_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[agent]\nrate_cooldown_pct = 50\n").unwrap();
+
+        let cli = Cli::parse_from([
+            "insane",
+            "--config",
+            config_path.to_str().unwrap(),
+            "status",
+        ]);
+        let effective = load(&cli).unwrap();
+        assert_eq!(effective.agent_rate_cooldown_pct, 50);
+    }
+
+    #[test]
+    fn agent_rate_cooldown_pct_rejects_values_above_100() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[agent]\nrate_cooldown_pct = 101\n").unwrap();
+
+        let cli = Cli::parse_from([
+            "insane",
+            "--config",
+            config_path.to_str().unwrap(),
+            "status",
+        ]);
+        assert!(load(&cli).is_err());
+    }
+
+    #[test]
+    fn agent_compact_max_tokens_defaults_to_1024() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let cli = Cli::parse_from([
+            "insane",
+            "--config",
+            config_path.to_str().unwrap(),
+            "status",
+        ]);
+        let effective = load(&cli).unwrap();
+        assert_eq!(
+            effective.agent_compact_max_tokens,
+            DEFAULT_AGENT_COMPACT_MAX_TOKENS
+        );
+    }
+
+    #[test]
+    fn agent_compact_max_tokens_configurable_via_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[agent]\ncompact_max_tokens = 512\n").unwrap();
+
+        let cli = Cli::parse_from([
+            "insane",
+            "--config",
+            config_path.to_str().unwrap(),
+            "status",
+        ]);
+        let effective = load(&cli).unwrap();
+        assert_eq!(effective.agent_compact_max_tokens, 512);
     }
 
     #[test]
